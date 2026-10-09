@@ -1,48 +1,62 @@
-> [!IMPORTANT]
-> This repository is no longer actively developed (last release 2023-03-06).
->
-> When I first created this fork of Idle Master in 2017/2018 I aimed to fix a bug plus extend some functionality and never expected it to live this long.
-> Sadly I have not been able to find the time to properly take care of it and I have decided to leave this project as-is and archive it. I hope you find some alternative software to fill the void.
->
-> Thank you.
+# Idle Master Extended
 
-[![Build status](https://ci.appveyor.com/api/projects/status/96wf12emnlbmo4sj?svg=true)](https://ci.appveyor.com/project/JonasNilson/idle-master-extended)
-![Github All Releases](https://img.shields.io/github/downloads/JonasNilson/idle_master_extended/total.svg)
+A small Windows desktop app for periodically idling Steam Trading Cards.
 
+This is [Moriko1's fork](https://github.com/Moriko1/idle_master_extended) of
+[jonas-med-ett-s/idle_master_extended](https://github.com/jonas-med-ett-s/idle_master_extended),
+originally created by [jshackles](https://github.com/jshackles/idle_master).
+It keeps the existing WinForms interface, idling modes, filters, themes and translations.
 
-# 🚀 Idle Master Extended
+## Download and run
 
-Get your [Steam Trading Cards](https://steamcommunity.com/tradingcards/) the quickest possible way.
+1. Download the **win-x64 ZIP** from [Releases](https://github.com/Moriko1/idle_master_extended/releases).
+2. Extract every file to a folder, then open **IdleMasterExtended.exe**.
+3. Keep Steam open and signed in. Select **Sign in** and complete Steam's official login page.
+4. Wait for the card scan, then press **Start**. Scanning and signing in do not start idling.
+5. **Pause** stops the idle helpers. **Resume** requires a manual click. Completion leaves a summary visible.
 
+Requirements: Windows 10/11 x64, .NET Framework 4.8, Steam, and Microsoft WebView2 Evergreen Runtime.
+The ZIP contains the app and its libraries; it uses the installed browser runtime.
+If that runtime is missing, the app links to [Microsoft's official WebView2 installer](https://developer.microsoft.com/microsoft-edge/webview2/).
 
-## ❓ But what is Idle Master Extended?
+Steam handles QR sign-in, passwords, Steam Guard and account challenges. The app uses its own
+browser profile and does not store passwords or copied cookies in ordinary settings or logs.
+Your Community login must match the account in the running Steam client.
+**Switch account** and **Sign out** affect this app's session.
 
-🔧 This is a fork of the **discontinued** [Idle Master](https://github.com/jshackles/idle_master) project by [jshackles](https://github.com/jshackles) (also known for [Enhanced Steam](https://github.com/jshackles/Enhanced_Steam)):
+## Everyday controls
 
-> This program will determine which of your Steam games still have Steam Trading Card drops remaining, and will go through each application to simulate you being “in-game” so that cards will drop. It will check periodically to see if the game you’re idling has card drops remaining. When only one drop remains, it will start checking more frequently. When the game you’re idling has no more cards, it’ll move on to the next game. When no more cards are available, the program will terminate. 
-> 
-> This application requires Steam to be open and for you to be logged in.  This program is now being developed exclusively for Microsoft Windows. Non-Windows versions are available in the [Python repository](https://github.com/jshackles/idle_master_py) but may be deprecated or feature incomplete.
-> 
-> Source: [`jshackles/idle_master`](https://github.com/jshackles/idle_master) 
+- **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
+- Temporary network errors preserve the last successful counts and stop interrupted runs.
+- Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings.
+- Whitelist mode has no automatic card completion; stop it manually. At most 30 games run together.
+- Settings changes apply only on **Save**. **Cancel** discards edits.
+- Closing the app stops its helpers. Sleep prevention applies only while idling.
+- Shutdown after completion remains an optional one-run setting, disabled by default.
 
+The browser session and diagnostic logs are stored under
+`%LocalAppData%\IdleMasterExtended\Moriko1`.
+Logs contain operation names and exception types/stacks, not cookies, passwords or page contents.
+Upgrading from upstream requires one fresh Steam sign-in; copied-cookie login is retired.
 
-## 🔽 Download
+## Building and verification
 
-- https://github.com/JonasNilson/idle_master_extended/releases
+See [build instructions](docs/BUILD.md) and [prerelease validation results](docs/VALIDATION.md).
+Run `python scripts/build.py` from a Windows checkout with Visual Studio MSBuild.
+The script restores build dependencies, builds both x64 .NET Framework 4.8 applications and runs
+the regression suites. It can also produce a portable ZIP, matching source ZIP and SHA-256 checksums.
 
+The first fork download is a **prerelease**. Automated tests cover synthetic Steam responses,
+card parsing, failures, cancellation, helper supervision, account checks and Settings Save/Cancel.
+Those tests do not prove successful sign-in or real card drops for your account.
+Live Steam sign-in, restart persistence and card-drop checks require user-operated validation.
 
-## 💭 [Idle Master Extended Wiki](https://github.com/JonasNilson/idle_master_extended/wiki)
+## Credits and license
 
-- 🧰 [Get started](https://github.com/JonasNilson/idle_master_extended/wiki/Get-started)
-- ✨ [Features](https://github.com/JonasNilson/idle_master_extended/wiki/Features)
-- 🔄 [FAQ](https://github.com/JonasNilson/idle_master_extended/wiki/FAQ)
-- 🔨 [Troubleshooting](https://github.com/JonasNilson/idle_master_extended/wiki/Troubleshooting-and-common-solutions)
-- 🎨 [Contribute](https://github.com/JonasNilson/idle_master_extended/wiki/Contribute)
-- 🎁 [Donate](https://github.com/JonasNilson/idle_master_extended/wiki/Donate)
+Idle Master was created by jshackles, based on Stumpokapow's original work.
+Idle Master Extended was maintained by Jonas Nilson (jonas-med-ett-s).
+This fork preserves their work and the [GNU GPL v2 license](LICENSE).
+Dependencies include Steamworks.NET, Html Agility Pack and Microsoft WebView2;
+see [third-party notices](docs/THIRD_PARTY.md).
 
-
-## Credits
-
-Idle Master was created by [jshackles](https://github.com/jshackles), based on the original code created by Stumpokapow.
-
-Idle Master was written in `C#` using `Steamworks.NET` and [`CSteamworks`](https://github.com/rlabrecque/CSteamworks), and using open source icons from [Open Iconic](https://github.com/iconic/open-iconic).
+Both source and executable downloads are published together, with checksums.

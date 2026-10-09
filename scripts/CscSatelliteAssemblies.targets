@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Use the same Roslyn compiler as the application for satellites, avoiding al.exe/SDK installation. -->
+  <Target Name="GenerateSatelliteAssemblies"
+          DependsOnTargets="ResolveAssemblyReferences"
+          Inputs="$(MSBuildAllProjects);@(_SatelliteAssemblyResourceInputs);$(IntermediateOutputPath)$(TargetName)$(TargetExt)"
+          Outputs="$(IntermediateOutputPath)%(Culture)\$(TargetName).resources.dll"
+          Condition="'@(_SatelliteAssemblyResourceInputs)' != ''">
+    <MakeDir Directories="@(_SatelliteAssemblyResourceInputs->'$(IntermediateOutputPath)%(Culture)')" />
+    <GetAssemblyIdentity AssemblyFiles="$(IntermediateOutputPath)$(TargetName)$(TargetExt)">
+      <Output TaskParameter="Assemblies" ItemName="_MainSatelliteIdentity" />
+    </GetAssemblyIdentity>
+    <PropertyGroup>
+      <_SatelliteSource>$(IntermediateOutputPath)%(_SatelliteAssemblyResourceInputs.Culture)\$(TargetName).resources.cs</_SatelliteSource>
+      <_SatelliteOutput>$(IntermediateOutputPath)%(_SatelliteAssemblyResourceInputs.Culture)\$(TargetName).resources.dll</_SatelliteOutput>
+    </PropertyGroup>
+    <ItemGroup>
+      <_SatelliteAttribute Remove="@(_SatelliteAttribute)" />
+      <_SatelliteAttribute Include="System.Reflection.AssemblyCultureAttribute">
+        <_Parameter1>%(_SatelliteAssemblyResourceInputs.Culture)</_Parameter1>
+      </_SatelliteAttribute>
+      <_SatelliteAttribute Include="System.Reflection.AssemblyVersionAttribute">
+        <_Parameter1>%(_MainSatelliteIdentity.Version)</_Parameter1>
+      </_SatelliteAttribute>
+      <_SatelliteReferences Include="@(ReferencePath)" Condition="'%(Filename)' == 'mscorlib'" />
+    </ItemGroup>
+    <WriteCodeFragment AssemblyAttributes="@(_SatelliteAttribute)" Language="C#" OutputFile="$(_SatelliteSource)">
+      <Output TaskParameter="OutputFile" ItemName="FileWrites" />
+    </WriteCodeFragment>
+    <Csc Sources="$(_SatelliteSource)" Resources="@(_SatelliteAssemblyResourceInputs)"
+         References="@(_SatelliteReferences)" OutputAssembly="$(_SatelliteOutput)"
+         TargetType="Library" NoConfig="true" NoLogo="true" Optimize="$(Optimize)"
+         ToolExe="$(CscToolExe)" ToolPath="$(CscToolPath)" UseSharedCompilation="$(UseSharedCompilation)">
+      <Output TaskParameter="OutputAssembly" ItemName="FileWrites" />
+    </Csc>
+  </Target>
+</Project>

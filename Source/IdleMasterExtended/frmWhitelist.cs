@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Windows.Forms;
 using IdleMasterExtended.Properties;
@@ -62,42 +62,18 @@ namespace IdleMasterExtended
             btnRemove.Image = Settings.Default.whiteIcons ? Resources.imgTrash_w : Resources.imgTrash;
         }
 
-        private async void btnSave_Click(object sender, EventArgs e)
+        private void btnSave_Click(object sender, EventArgs e)
         {
             SaveWhitelist();
-
-            if (Settings.Default.IdlingModeWhitelist)
-            {
-                mainForm.StopIdle();
-                await mainForm.LoadBadgesAsync();
-
-                if (lstWhitelist.Items.Count == 1)
-                {
-                    mainForm.StartSoloIdle(
-                        mainForm.AllBadges.FirstOrDefault(b => b.AppId == int.Parse(lstWhitelist.Items[0].ToString()))
-                    );
-                }
-                else if (lstWhitelist.Items.Count > 1)
-                {
-                    mainForm.StartMultipleIdle();
-                }
-
-                mainForm.DisableCardDropCheckTimer();
-                mainForm.UpdateStateInfo();
-            }
-            else
-            {
-                mainForm.EnableCardDropCheckTimer();
-            }
-
+            DialogResult = DialogResult.OK;
             Close();
         }
 
         private void btnAdd_Click(object sender, EventArgs e)
         {
             int result;
-            
-            if (int.TryParse(txtAppid.Text, out result)
+
+            if (int.TryParse(txtAppid.Text, out result) && result > 0
                 && lstWhitelist.Items.Cast<string>().All(blApp => blApp != txtAppid.Text))
             {
                 lstWhitelist.Items.Add(txtAppid.Text);

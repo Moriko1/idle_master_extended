@@ -87,3 +87,9 @@ Desktop.ini
 *.pfx
 
 *.snk
+
+# Local package and verification outputs
+dist/
+artifacts/
+__pycache__/
+scripts/.edit_*

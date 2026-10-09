@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Drawing;
 using System.Windows.Forms;
 using IdleMasterExtended.Properties;
@@ -10,13 +10,18 @@ namespace IdleMasterExtended
 {
     public partial class frmSettings : Form
     {
+        private bool loading = true;
         public frmSettings()
         {
             InitializeComponent();
+            btnAdvanced.Visible = false;
+            chkIgnoreClientStatus.Enabled = false;
+            ttHints.SetToolTip(chkIgnoreClientStatus, "The Steam client account must match your signed-in account.");
         }
 
         private void btnCancel_Click(object sender, EventArgs e)
         {
+            DialogResult = DialogResult.Cancel;
             Close();
         }
 
@@ -44,9 +49,9 @@ namespace IdleMasterExtended
                 Settings.Default.language = cboLanguage.Text;
             }
 
-            Settings.Default.OneThenMany = Settings.Default.OnlyOneGameIdle 
+            Settings.Default.OneThenMany = Settings.Default.OnlyOneGameIdle
                 = Settings.Default.fastMode = Settings.Default.IdlingModeWhitelist = false;
-            
+
             if (radFastMode.Checked)
             {
                 Settings.Default.fastMode = true;
@@ -65,14 +70,21 @@ namespace IdleMasterExtended
             }
 
             Settings.Default.minToTray = chkMinToTray.Checked;
-            Settings.Default.ignoreclient = chkIgnoreClientStatus.Checked;
+            Settings.Default.ignoreclient = false;
             Settings.Default.showUsername = chkShowUsername.Checked;
             Settings.Default.NoSleep = chkPreventSleep.Checked;
             Settings.Default.ShutdownWindowsOnDone = chkShutdown.Checked;
             Settings.Default.IdleOnlyPlayed = chkIdleOnlyPlayed.Checked;
 
+            Settings.Default.customTheme = darkThemeCheckBox.Checked;
+            Settings.Default.whiteIcons = darkThemeCheckBox.Checked;
+            if (darkThemeCheckBox.Checked)
+            {
+                Settings.Default.colorBgd = Color.FromArgb(38, 38, 38);
+                Settings.Default.colorTxt = Color.FromArgb(196, 196, 196);
+            }
             Settings.Default.Save();
-
+            DialogResult = DialogResult.OK;
             Close();
         }
 
@@ -114,13 +126,13 @@ namespace IdleMasterExtended
             grpGeneral.Text = localization.strings.general;
             grpIdlingQuantity.Text = localization.strings.idling_behavior;
             grpPriority.Text = localization.strings.idling_order;
-            btnOK.Text = localization.strings.accept;
+            btnOK.Text = UiText.Get("save");
             btnCancel.Text = localization.strings.cancel;
-            ttHints.SetToolTip(btnAdvanced, localization.strings.advanced_auth);
+            btnAdvanced.Visible = false;
             chkMinToTray.Text = localization.strings.minimize_to_tray;
             ttHints.SetToolTip(chkMinToTray, localization.strings.minimize_to_tray);
             chkIgnoreClientStatus.Text = localization.strings.ignore_client_status;
-            ttHints.SetToolTip(chkIgnoreClientStatus, localization.strings.ignore_client_status);
+            ttHints.SetToolTip(chkIgnoreClientStatus, "The Steam client account must match your signed-in account.");
             chkShowUsername.Text = localization.strings.show_username;
             ttHints.SetToolTip(chkShowUsername, localization.strings.show_username);
             radOneGameOnly.Text = localization.strings.idle_individual;
@@ -160,10 +172,8 @@ namespace IdleMasterExtended
                 chkMinToTray.Checked = true;
             }
 
-            if (Settings.Default.ignoreclient)
-            {
-                chkIgnoreClientStatus.Checked = true;
-            }
+            chkIgnoreClientStatus.Checked = false;
+            chkIgnoreClientStatus.Enabled = false;
 
             if (Settings.Default.showUsername)
             {
@@ -185,30 +195,18 @@ namespace IdleMasterExtended
                 chkIdleOnlyPlayed.Checked = true;
             }
 
+            darkThemeCheckBox.Checked = Settings.Default.customTheme;
+            loading = false;
             runtimeCustomThemeSettings();
         }
 
 
         private void runtimeCustomThemeSettings()
         {
-            // Read settings
-            var customTheme = Settings.Default.customTheme;
-            var whiteIcons = Settings.Default.whiteIcons;
-
-            // Set checkboxes (Not necessary, as the checkboxes are bound to the global setting)
-            //darkThemeCheckBox.Checked = customTheme;
-            //whiteIconsCheckBox.Checked = whiteIcons;
-
-            if (customTheme)
-            {
-                // Custom theme colors (could be user selected, probably)
-                Settings.Default.colorBgd = Color.FromArgb(38, 38, 38);
-                Settings.Default.colorTxt = Color.FromArgb(196, 196, 196);
-            }
-
-            // Define colors
-            Color colorBgd = customTheme ? Settings.Default.colorBgd : Settings.Default.colorBgdOriginal;
-            Color colorTxt = customTheme ? Settings.Default.colorTxt : Settings.Default.colorTxtOriginal;
+            // Preview the staged theme without writing any application settings.
+            var customTheme = darkThemeCheckBox.Checked;
+            Color colorBgd = customTheme ? Color.FromArgb(38, 38, 38) : Settings.Default.colorBgdOriginal;
+            Color colorTxt = customTheme ? Color.FromArgb(196, 196, 196) : Settings.Default.colorTxtOriginal;
 
             // Define button style
             FlatStyle buttonStyle = customTheme ? FlatStyle.Flat : FlatStyle.Standard;
@@ -238,35 +236,31 @@ namespace IdleMasterExtended
 
             // Update the icon(s)
             runtimeWhiteIconsSettings();
-            Settings.Default.Save();
         }
 
         private void runtimeWhiteIconsSettings()
         {
-            btnAdvanced.Image = Settings.Default.whiteIcons ? Resources.imgLock_w : Resources.imgLock;
+            btnAdvanced.Image = darkThemeCheckBox.Checked ? Resources.imgLock_w : Resources.imgLock;
         }
 
         private void btnAdvanced_Click(object sender, EventArgs e)
         {
-            var frm = new frmSettingsAdvanced();
-            frm.ShowDialog();
+            MessageBox.Show("Use Sign in on the main window to sign in through Steam.");
         }
 
         private void darkThemeCheckBox_CheckedChanged(object sender, EventArgs e)
         {
-            Settings.Default.customTheme = darkThemeCheckBox.Checked;
-            Settings.Default.whiteIcons = darkThemeCheckBox.Checked;
-            runtimeCustomThemeSettings();
+            if (!loading) runtimeCustomThemeSettings();
         }
 
         private void chkShutdown_CheckedChanged(object sender, EventArgs e)
         {
-            if (chkShutdown.Checked)
+            if (!loading && chkShutdown.Checked)
             {
                 if (MessageBox.Show("Are you sure you want Idle Master Extended to shutdown Windows when idling is done?\n\nNote: This setting will only be active once.",
                                     "Shutdown Windows", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK)
                 {
-                    Settings.Default.ShutdownWindowsOnDone = chkShutdown.Checked;
+                    // The choice is committed only by Save.
                 }
                 else
                 {
@@ -282,7 +276,7 @@ namespace IdleMasterExtended
 
         private void lnkGitHubWiki_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
-            Process.Start("https://github.com/JonasNilson/idle_master_extended/wiki");
+            Process.Start("https://github.com/Moriko1/idle_master_extended#readme");
         }
     }
 }

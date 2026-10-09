@@ -1,31 +1,33 @@
-﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.7.34018.315
 MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "steam-idle", "..\steam-idle Source\steam-idle\steam-idle.csproj", "{E0E49AFD-1101-4815-A1F1-01F65D4D3306}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IdleMasterExtended", "IdleMasterExtended\IdleMasterExtended.csproj", "{D26CAFBB-F684-4E53-BE38-60AAD2531893}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IdleMasterExtended.Tests", "IdleMasterExtended.Tests\IdleMasterExtended.Tests.csproj", "{3677D7CC-C773-4F5D-821F-8262BDB57EC3}"
+EndProject
 Global
-	GlobalSection(SolutionConfigurationPlatforms) = preSolution
-		Debug|Any CPU = Debug|Any CPU
-		Debug|x86 = Debug|x86
-		Release|Any CPU = Release|Any CPU
-		Release|x86 = Release|x86
-	EndGlobalSection
-	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|x86.ActiveCfg = Release|x86
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|x86.Build.0 = Release|x86
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|Any CPU.Build.0 = Release|Any CPU
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|x86.ActiveCfg = Release|x86
-		{D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|x86.Build.0 = Release|x86
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
-	EndGlobalSection
-	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {910EC50F-B9F4-466E-A6D8-4EFCD49D408E}
-	EndGlobalSection
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug|x64 = Debug|x64
+        Release|x64 = Release|x64
+    EndGlobalSection
+    GlobalSection(ProjectConfigurationPlatforms) = postSolution
+        {E0E49AFD-1101-4815-A1F1-01F65D4D3306}.Debug|x64.ActiveCfg = Debug|x64
+        {E0E49AFD-1101-4815-A1F1-01F65D4D3306}.Debug|x64.Build.0 = Debug|x64
+        {E0E49AFD-1101-4815-A1F1-01F65D4D3306}.Release|x64.ActiveCfg = Release|x64
+        {E0E49AFD-1101-4815-A1F1-01F65D4D3306}.Release|x64.Build.0 = Release|x64
+        {D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|x64.ActiveCfg = Debug|x64
+        {D26CAFBB-F684-4E53-BE38-60AAD2531893}.Debug|x64.Build.0 = Debug|x64
+        {D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|x64.ActiveCfg = Release|x64
+        {D26CAFBB-F684-4E53-BE38-60AAD2531893}.Release|x64.Build.0 = Release|x64
+        {3677D7CC-C773-4F5D-821F-8262BDB57EC3}.Debug|x64.ActiveCfg = Debug|x64
+        {3677D7CC-C773-4F5D-821F-8262BDB57EC3}.Debug|x64.Build.0 = Debug|x64
+        {3677D7CC-C773-4F5D-821F-8262BDB57EC3}.Release|x64.ActiveCfg = Release|x64
+        {3677D7CC-C773-4F5D-821F-8262BDB57EC3}.Release|x64.Build.0 = Release|x64
+    EndGlobalSection
+    GlobalSection(SolutionProperties) = preSolution
+        HideSolutionNode = FALSE
+    EndGlobalSection
 EndGlobal

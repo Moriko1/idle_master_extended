@@ -1,110 +1,52 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<root>
-  <!-- 
-    Microsoft ResX Schema 
-    
-    Version 2.0
-    
-    The primary goals of this format is to allow a simple XML format 
-    that is mostly human readable. The generation and parsing of the 
-    various data types are done through the TypeConverter classes 
-    associated with the data types.
-    
-    Example:
-    
-    ... ado.net/XML headers & schema ...
-    <resheader name="resmimetype">text/microsoft-resx</resheader>
-    <resheader name="version">2.0</resheader>
-    <resheader name="reader">System.Resources.ResXResourceReader, System.Windows.Forms, ...</resheader>
-    <resheader name="writer">System.Resources.ResXResourceWriter, System.Windows.Forms, ...</resheader>
-    <data name="Name1"><value>this is my long string</value><comment>this is a comment</comment></data>
-    <data name="Color1" type="System.Drawing.Color, System.Drawing">Blue</data>
-    <data name="Bitmap1" mimetype="application/x-microsoft.net.object.binary.base64">
-        <value>[base64 mime encoded serialized .NET Framework object]</value>
-    </data>
-    <data name="Icon1" type="System.Drawing.Icon, System.Drawing" mimetype="application/x-microsoft.net.object.bytearray.base64">
-        <value>[base64 mime encoded string representing a byte array form of the .NET Framework object]</value>
-        <comment>This is a comment</comment>
-    </data>
-                
-    There are any number of "resheader" rows that contain simple 
-    name/value pairs.
-    
-    Each data row contains a name, and value. The row also contains a 
-    type or mimetype. Type corresponds to a .NET class that support 
-    text/value conversion through the TypeConverter architecture. 
-    Classes that don't support this are serialized and stored with the 
-    mimetype set.
-    
-    The mimetype is used for serialized objects, and tells the 
-    ResXResourceReader how to depersist the object. This is currently not 
-    extensible. For a given mimetype the value must be set accordingly:
-    
-    Note - application/x-microsoft.net.object.binary.base64 is the format 
-    that the ResXResourceWriter will generate, however the reader can 
-    read any of the formats listed below.
-    
-    mimetype: application/x-microsoft.net.object.binary.base64
-    value   : The object must be serialized with 
-            : System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-            : and then encoded with base64 encoding.
-    
-    mimetype: application/x-microsoft.net.object.soap.base64
-    value   : The object must be serialized with 
-            : System.Runtime.Serialization.Formatters.Soap.SoapFormatter
-            : and then encoded with base64 encoding.
+<?xml version='1.0' encoding='utf-8'?>
+<root xmlns:ns1="urn:schemas-microsoft-com:xml-msdata" xmlns:xs="http://www.w3.org/2001/XMLSchema">
 
-    mimetype: application/x-microsoft.net.object.bytearray.base64
-    value   : The object must be serialized into a byte array 
-            : using a System.ComponentModel.TypeConverter
-            : and then encoded with base64 encoding.
-    -->
-  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
-    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
-    <xsd:element name="root" msdata:IsDataSet="true">
-      <xsd:complexType>
-        <xsd:choice maxOccurs="unbounded">
-          <xsd:element name="metadata">
-            <xsd:complexType>
-              <xsd:sequence>
-                <xsd:element name="value" type="xsd:string" minOccurs="0" />
-              </xsd:sequence>
-              <xsd:attribute name="name" use="required" type="xsd:string" />
-              <xsd:attribute name="type" type="xsd:string" />
-              <xsd:attribute name="mimetype" type="xsd:string" />
-              <xsd:attribute ref="xml:space" />
-            </xsd:complexType>
-          </xsd:element>
-          <xsd:element name="assembly">
-            <xsd:complexType>
-              <xsd:attribute name="alias" type="xsd:string" />
-              <xsd:attribute name="name" type="xsd:string" />
-            </xsd:complexType>
-          </xsd:element>
-          <xsd:element name="data">
-            <xsd:complexType>
-              <xsd:sequence>
-                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
-                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
-              </xsd:sequence>
-              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
-              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
-              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
-              <xsd:attribute ref="xml:space" />
-            </xsd:complexType>
-          </xsd:element>
-          <xsd:element name="resheader">
-            <xsd:complexType>
-              <xsd:sequence>
-                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
-              </xsd:sequence>
-              <xsd:attribute name="name" type="xsd:string" use="required" />
-            </xsd:complexType>
-          </xsd:element>
-        </xsd:choice>
-      </xsd:complexType>
-    </xsd:element>
-  </xsd:schema>
+  <xs:schema id="root">
+    <xs:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xs:element name="root" ns1:IsDataSet="true">
+      <xs:complexType>
+        <xs:choice maxOccurs="unbounded">
+          <xs:element name="metadata">
+            <xs:complexType>
+              <xs:sequence>
+                <xs:element name="value" type="xsd:string" minOccurs="0" />
+              </xs:sequence>
+              <xs:attribute name="name" use="required" type="xsd:string" />
+              <xs:attribute name="type" type="xsd:string" />
+              <xs:attribute name="mimetype" type="xsd:string" />
+              <xs:attribute ref="xml:space" />
+            </xs:complexType>
+          </xs:element>
+          <xs:element name="assembly">
+            <xs:complexType>
+              <xs:attribute name="alias" type="xsd:string" />
+              <xs:attribute name="name" type="xsd:string" />
+            </xs:complexType>
+          </xs:element>
+          <xs:element name="data">
+            <xs:complexType>
+              <xs:sequence>
+                <xs:element name="value" type="xsd:string" minOccurs="0" ns1:Ordinal="1" />
+                <xs:element name="comment" type="xsd:string" minOccurs="0" ns1:Ordinal="2" />
+              </xs:sequence>
+              <xs:attribute name="name" type="xsd:string" use="required" ns1:Ordinal="1" />
+              <xs:attribute name="type" type="xsd:string" ns1:Ordinal="3" />
+              <xs:attribute name="mimetype" type="xsd:string" ns1:Ordinal="4" />
+              <xs:attribute ref="xml:space" />
+            </xs:complexType>
+          </xs:element>
+          <xs:element name="resheader">
+            <xs:complexType>
+              <xs:sequence>
+                <xs:element name="value" type="xsd:string" minOccurs="0" ns1:Ordinal="1" />
+              </xs:sequence>
+              <xs:attribute name="name" type="xsd:string" use="required" />
+            </xs:complexType>
+          </xs:element>
+        </xs:choice>
+      </xs:complexType>
+    </xs:element>
+  </xs:schema>
   <resheader name="resmimetype">
     <value>text/microsoft-resx</value>
   </resheader>
@@ -208,10 +150,10 @@
     <value>Signed in as</value>
   </data>
   <data name="sign_in" xml:space="preserve">
-    <value>Sign In</value>
+    <value>Sign in</value>
   </data>
   <data name="sign_out" xml:space="preserve">
-    <value>Sign Out</value>
+    <value>Sign out</value>
   </data>
   <data name="skip_current_game" xml:space="preserve">
     <value>&amp;Skip Current Game</value>
@@ -350,4 +292,5 @@ your Steam account.</value>
   <data name="whitelist" xml:space="preserve">
     <value>&amp;Whitelist</value>
   </data>
+<data name="steam_sign_in_help" xml:space="preserve"><value>Sign in on Steam's official page. Your password stays with Steam.</value></data><data name="switch_account" xml:space="preserve"><value>Switch account</value></data><data name="sign_in_network" xml:space="preserve"><value>Steam could not be reached. Check your connection and retry.</value></data><data name="start" xml:space="preserve"><value>Start</value></data><data name="resume" xml:space="preserve"><value>Resume</value></data><data name="refresh" xml:space="preserve"><value>Refresh</value></data><data name="retry" xml:space="preserve"><value>Retry</value></data><data name="releases" xml:space="preserve"><value>Releases</value></data><data name="webview_missing" xml:space="preserve"><value>Steam sign-in needs Microsoft WebView2 Runtime. Select Install browser to open Microsoft's setup page.</value></data><data name="install_browser" xml:space="preserve"><value>Install browser</value></data><data name="browser_failed" xml:space="preserve"><value>The Steam browser could not start. Close other copies of this app and retry.</value></data><data name="startup_failed" xml:space="preserve"><value>The application could not initialize. See the diagnostic log in Local AppData.</value></data><data name="account_changed" xml:space="preserve"><value>The Steam account changed. Switch account, then scan again before starting.</value></data><data name="scanning" xml:space="preserve"><value>Checking your Steam account and remaining cards...</value></data><data name="no_cards" xml:space="preserve"><value>No eligible card drops remain. Refresh after new drops become available.</value></data><data name="ready_to_start" xml:space="preserve"><value>Ready. Press Start to begin card idling.</value></data><data name="scan_failed" xml:space="preserve"><value>Card scan failed. Previous counts were kept. Retry when Steam is available.</value></data><data name="steam_required" xml:space="preserve"><value>Open Steam and sign in to the same account before starting.</value></data><data name="running" xml:space="preserve"><value>Idling. Pause stops all idle helpers.</value></data><data name="paused" xml:space="preserve"><value>Paused. Press Resume when you are ready.</value></data><data name="starting" xml:space="preserve"><value>Starting idle helpers and verifying the Steam account...</value></data><data name="completion_summary" xml:space="preserve"><value>Complete: {0} observed card drops in {1}. All idle helpers have stopped.</value></data><data name="idle_failed" xml:space="preserve"><value>Idling stopped after a helper or connection failure. Retry, then press Resume.</value></data><data name="signed_out" xml:space="preserve"><value>Signed out. Sign in to Steam to scan for cards.</value></data><data name="account_connected" xml:space="preserve"><value>Steam account connected</value></data><data name="sign_in_required" xml:space="preserve"><value>Steam sign-in required</value></data><data name="account_unavailable" xml:space="preserve"><value>Steam account check unavailable</value></data><data name="whitelist_mode" xml:space="preserve"><value>Whitelist mode: manual stop; card counts unavailable.</value></data><data name="cards_remaining" xml:space="preserve"><value>{0} card drops remaining</value></data><data name="games_available" xml:space="preserve"><value>{0} eligible games, {1} idling now</value></data><data name="drops" xml:space="preserve"><value>drops</value></data><data name="save" xml:space="preserve"><value>Save</value></data><data name="cards_not_scanned" xml:space="preserve"><value>Card drops have not been scanned.</value></data>  <data name="skip" xml:space="preserve"><value>Skip</value></data>
 </root>
