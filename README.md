@@ -30,12 +30,15 @@ Your Community login must match the account in the running Steam client.
 - Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
 - Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings.
 - Whitelist mode has no automatic card completion; stop it manually. At most 30 games run together.
+- Show Steam username defaults to on. Saved preferences survive restarts and portable-folder upgrades.
+- **Start** stays disabled when there are no eligible games.
 - Settings changes apply only on **Save**. **Cancel** discards edits and leaves idling alone. During a session, appearance and sleep settings apply immediately; mode and filter changes apply to the next session.
 - Closing the app stops its helpers. Sleep prevention applies only while idling.
 - Shutdown after completion remains an optional one-run setting, disabled by default. Its completion summary offers a shutdown button; completion does not open a system prompt.
 
 The browser session and diagnostic logs are stored under
 `%LocalAppData%\IdleMasterExtended\Moriko1`.
+Ordinary preferences use `preferences.xml` in that same folder, with atomic saves and a backup; cookies remain in the browser profile. Existing ordinary settings are migrated when available.
 Logs contain operation names and exception types/stacks, not cookies, passwords or page contents.
 Upgrading from upstream requires one fresh Steam sign-in; copied-cookie login is retired.
 

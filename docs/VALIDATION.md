@@ -12,6 +12,8 @@ An explicit Stop button and natural queue completion show a session summary as a
 
 Opening Settings or a filter editor no longer stops idling. Cancel preserves the run; saved mode/filter settings are frozen until the next session. Appearance and sleep preferences can apply immediately.
 
+Show Steam username defaults to on in the generated settings, settings definition and executable configuration. A version-independent provider stores ordinary preferences in `%LocalAppData%\IdleMasterExtended\Moriko1\preferences.xml`, migrates known ordinary legacy settings and excludes all cookie/account-token entries. Atomic saves keep a backup; malformed/oversized/DTD files are preserved and recover from a valid backup when available. Explicit saved choices, including hiding the username, survive fresh settings instances. Start remains disabled for empty/finished/filtered queues, unready scans, invalid sessions and active runs.
+
 ## Previous fix in preview.2
 
 The initial preview attempted to import every browser cookie. The user's login-window error was traced to CookieException during CookieContainer.Add, before any HTTP request. Browser preferences containing commas reproduce this .NET Framework failure. Preview.2 imports only Community authentication/session/parental cookies without transforming token values, and distinguishes invalid authentication from network failure. New regression cases cover comma/semicolon/overlong preferences, exact domains, preservation of authentication values and malformed authentication.
@@ -21,13 +23,15 @@ Blank badge-index counts now use an explicit count from the individual card page
 ## Passed
 
 - Both executables build as x64 Release for .NET Framework 4.8, with no compiler warnings or errors.
-- Six regression suites pass: Community reads and badge parsing; run supervision and cancellation; Settings Save/Cancel; session identity verification; verified helper reconnect decisions; session summaries and nonactivating child controls.
+- Eight regression suites pass: Community reads and badge parsing; run supervision and cancellation; Settings Save/Cancel; session identity verification; verified helper reconnect decisions; session summaries and nonactivating child controls; portable settings persistence and migration; Start availability.
 - Synthetic HTTP cases include authenticated empty accounts, expired login, timeouts, HTTP 429, malformed pages, pagination, decimal formats and retention of the previous snapshot. New cases cover verified ownership, shared-license counts, rejected redirects, cancellation of streams that ignore tokens, explicit count phrases, and legitimate scans requiring more than 128 detail reads.
 - A main-window regression forces a false client probe while a verified fake helper runs; neither helper nor queue stops. Manual Stop and verified completion present summaries, and repeated Stop keeps the same summary.
 - Controller cases cover cancellation during launches and fast-mode delays, 30-helper limits, initialization failure, unexpected exit, account mismatch, skipped games on resume, failed scans and completion cleanup.
 - A real Windows Job Object test confirms that disposing the owned job stops its child and leaves an unrelated process running.
 - Main-window rendering and control geometry pass at synthetic 100%, 125%, 150% and 200% scales, in light and dark themes. Settings controls, long failure messages, the Stop action and session summaries render visibly. These are rendered forms, not actual monitor DPI changes.
 - The desktop application opened and remained running from a portable test folder with C:/Windows as its working directory.
+- Fresh settings instances reload saved booleans, modes, language, colors and both filter lists. Tests also cover saved username opt-out, unsaved edits, cookie exclusion, upgrade/reset, XML bounds, corruption preservation and backup recovery.
+- Empty and completed queues keep Start disabled, including a connected authenticated synthetic session. Whitelist eligibility, filters, busy/scanning, active runs and Resume are covered separately.
 - Git whitespace validation passes.
 
 ## Live account evidence

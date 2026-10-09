@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Configuration;
 using System.IO;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using IdleMasterExtended.Properties;
@@ -139,11 +138,6 @@ namespace IdleMasterExtended.Tests
             }
         }
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr LoadLibrary(string path);
-        [DllImport("kernel32.dll")]
-        private static extern bool FreeLibrary(IntPtr module);
-
         private static void EditingSettingsKeepsHelpers()
         {
             var savedSettings = new Dictionary<string, object>();
@@ -151,19 +145,15 @@ namespace IdleMasterExtended.Tests
                 savedSettings[property.Name] = Settings.Default[property.Name];
             var culture = Thread.CurrentThread.CurrentUICulture;
             var synchronization = SynchronizationContext.Current;
-            var directory = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
-            while (directory != null && !File.Exists(Path.Combine(directory.FullName, "Dependencies", "steam_api64.dll")))
-                directory = directory.Parent;
-            Test.Assert(directory != null, "The settings integration probe requires a repository build.");
-            var native = LoadLibrary(Path.Combine(directory.FullName, "Dependencies", "steam_api64.dll"));
-            Test.Assert(native != IntPtr.Zero, "The x64 Steam runtime could not be loaded for the UI probe.");
+            SettingsSavingEventHandler cancelPersistence = (sender, args) => args.Cancel = true;
+            Settings.Default.SettingsSaving += cancelPersistence;
             try
             {
                 Settings.Default.language = "English";
                 var factory = new FakeFactory();
                 var games = new[] { Game(1, 4) };
                 using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games)))
-                using (var main = new frmMain())
+                using (var main = new frmMain(() => true))
                 {
                     bool loaded = false;
                     main.Load += (sender, args) => loaded = true;
@@ -232,7 +222,7 @@ namespace IdleMasterExtended.Tests
             }
             finally
             {
-                FreeLibrary(native);
+                Settings.Default.SettingsSaving -= cancelPersistence;
                 SynchronizationContext.SetSynchronizationContext(synchronization);
                 Thread.CurrentThread.CurrentUICulture = culture;
                 foreach (var pair in savedSettings) Settings.Default[pair.Key] = pair.Value;

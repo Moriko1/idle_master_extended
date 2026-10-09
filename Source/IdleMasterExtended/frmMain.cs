@@ -20,6 +20,7 @@ namespace IdleMasterExtended
         public List<Badge> AllBadges { get; private set; } = new List<Badge>();
         public Badge CurrentBadge { get; private set; }
         private readonly SteamSessionService session = new SteamSessionService();
+        private readonly Func<bool> steamClientIsRunning;
         private readonly WebView2 browser = new WebView2 { Size = new Size(1, 1), Visible = false };
         private readonly CancellationTokenSource lifetime = new CancellationTokenSource();
         private readonly SemaphoreSlim scanGate = new SemaphoreSlim(1, 1);
@@ -49,8 +50,10 @@ namespace IdleMasterExtended
         private IdleRunStatus runStatus;
         private readonly Image darkTrue = InvertStatusImage(Resources.imgTrue);
         private readonly Image darkFalse = InvertStatusImage(Resources.imgFalse);
-        public frmMain()
+        public frmMain() : this(SteamAPI.IsSteamRunning) { }
+        internal frmMain(Func<bool> steamClientIsRunning)
         {
+            this.steamClientIsRunning = steamClientIsRunning ?? throw new ArgumentNullException(nameof(steamClientIsRunning));
             InitializeComponent();
             Controls.Add(browser);
             ConfigureControls();
@@ -287,7 +290,7 @@ namespace IdleMasterExtended
         private async Task StartOrResumeAsync()
         {
             if (busy || Running || controller == null || !session.IsInitialized || closing) return;
-            if (!SteamAPI.IsSteamRunning()) { SetMessage(UiText.Get("steam_required")); return; }
+            if (!steamClientIsRunning()) { SetMessage(UiText.Get("steam_required")); return; }
             if (!ready) { await RefreshManuallyAsync(); if (!ready) return; }
             busy = true; UpdateButtons();
             try
@@ -443,7 +446,7 @@ namespace IdleMasterExtended
         private void UpdateButtons()
         {
             if (closing || IsDisposed) return;
-            btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && SteamAPI.IsSteamRunning();
+            btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && steamClientIsRunning();
             btnStart.Text = runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted ? UiText.Get("resume") : UiText.Get("start");
             btnStop.Enabled = !busy && sessionTracker.Active;
             btnPause.Enabled = !busy && Running; btnRefresh.Enabled = !busy && !Running && session.IsInitialized;
@@ -528,7 +531,7 @@ namespace IdleMasterExtended
         }
         private void CheckSteam()
         {
-            UpdateSteamClientStatus(SteamAPI.IsSteamRunning());
+            UpdateSteamClientStatus(steamClientIsRunning());
         }
         private void UpdateSteamClientStatus(bool available)
         {
@@ -572,7 +575,7 @@ namespace IdleMasterExtended
             GamesState.BackColor = BackColor; GamesState.ForeColor = ForeColor; mnuTop.BackColor = BackColor; mnuTop.ForeColor = ForeColor;
             ssFooter.BackColor = BackColor; ssFooter.ForeColor = ForeColor;
             summaryPanel.ApplyTheme(BackColor, ForeColor, Settings.Default.customTheme);
-            picCookieStatus.Image = StatusImage(authenticated); picSteamStatus.Image = StatusImage(SteamAPI.IsSteamRunning());
+            picCookieStatus.Image = StatusImage(authenticated); picSteamStatus.Image = StatusImage(steamClientIsRunning());
             foreach (var link in new[] { lnkSignIn, lnkResetCookies, switchAccount, lblCurrentStatus, lblGameName, lnkLatestRelease })
                 link.LinkColor = link.ForeColor = Settings.Default.customTheme ? Color.GhostWhite : Color.Blue;
         }
