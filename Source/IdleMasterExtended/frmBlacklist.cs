@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Windows.Forms;
 using IdleMasterExtended.Properties;
@@ -68,6 +68,7 @@ namespace IdleMasterExtended
         private void btnSave_Click(object sender, EventArgs e)
         {
             SaveBlacklist();
+            DialogResult = DialogResult.OK;
             Close();
         }
 

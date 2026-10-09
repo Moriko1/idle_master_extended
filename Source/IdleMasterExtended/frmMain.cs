@@ -25,6 +25,14 @@ namespace IdleMasterExtended
         private readonly SemaphoreSlim scanGate = new SemaphoreSlim(1, 1);
         private readonly Button btnStart = new Button();
         private readonly Button btnRefresh = new Button();
+        private readonly Button btnStop = new Button();
+        private readonly SessionSummaryPanel summaryPanel = new SessionSummaryPanel();
+        private readonly IdleSessionTracker sessionTracker = new IdleSessionTracker();
+        private IdleMode runMode;
+        private bool runOnlyPlayed, deferredRunSettings;
+        private string runSort;
+        private HashSet<string> runBlacklist = new HashSet<string>();
+        private List<string> runWhitelist = new List<string>();
         private readonly LinkLabel switchAccount = new LinkLabel();
         private readonly Stopwatch elapsed = new Stopwatch();
         private readonly HttpClient artworkClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
@@ -72,15 +80,21 @@ namespace IdleMasterExtended
             lblCurrentStatus.Location = new Point(15, 157); lblCurrentStatus.AutoSize = false; lblCurrentStatus.Size = new Size(370, 43);
             lblCurrentStatus.Links.Clear(); lblCurrentStatus.Enabled = true;
             lblGameName.Location = new Point(15, 236); lblGameName.Size = new Size(365, 16);
-            btnStart.Text = UiText.Get("start"); btnStart.Location = new Point(15, 202); btnStart.Size = new Size(85, 28);
+            btnStart.Text = UiText.Get("start"); btnStart.Location = new Point(15, 202); btnStart.Size = new Size(70, 28);
             btnStart.Click += async (s, e) => await StartOrResumeAsync();
             Controls.Add(btnStart);
-            btnPause.Text = localization.strings.pause_idling; btnPause.Image = null; btnPause.Location = new Point(106, 202); btnPause.Size = new Size(85, 28);
-            btnSkip.Text = UiText.Get("skip"); btnSkip.Image = null; btnSkip.Location = new Point(197, 202); btnSkip.Size = new Size(85, 28);
-            btnRefresh.Text = UiText.Get("refresh"); btnRefresh.Location = new Point(288, 202); btnRefresh.Size = new Size(97, 28);
+            btnPause.Text = UiText.Get("pause"); btnPause.Image = null; btnPause.Location = new Point(90, 202); btnPause.Size = new Size(70, 28);
+            btnSkip.Text = UiText.Get("skip"); btnSkip.Image = null; btnSkip.Location = new Point(165, 202); btnSkip.Size = new Size(70, 28);
+            btnRefresh.Text = UiText.Get("refresh"); btnRefresh.Location = new Point(315, 202); btnRefresh.Size = new Size(70, 28);
             btnRefresh.Click += async (s, e) => await RefreshManuallyAsync();
             Controls.Add(btnRefresh);
-            foreach (var button in new[] { btnStart, btnPause, btnSkip, btnRefresh })
+            btnStop.Text = UiText.Get("stop"); btnStop.Location = new Point(240, 202); btnStop.Size = new Size(70, 28);
+            btnStop.Click += async (sender, args) => await StopSessionAsync();
+            Controls.Add(btnStop);
+            summaryPanel.Location = new Point(15, 153);
+            summaryPanel.ShutdownRequested += (sender, args) => ScheduleShutdown();
+            Controls.Add(summaryPanel);
+            foreach (var button in new[] { btnStart, btnPause, btnSkip, btnStop, btnRefresh })
                 button.Paint += (sender, args) =>
                 {
                     if (button.Enabled || !Settings.Default.customTheme) return;
@@ -163,17 +177,21 @@ namespace IdleMasterExtended
             lnkSignIn.Text = UiText.Get("sign_in"); lnkResetCookies.Text = UiText.Get("sign_out");
             lnkLatestRelease.Text = UiText.Get("releases");
             GameName.Text = localization.strings.name; Hours.Text = localization.strings.hours;
-            btnStart.Text = UiText.Get("start"); btnPause.Text = localization.strings.pause_idling; btnRefresh.Text = UiText.Get("refresh"); switchAccount.Text = UiText.Get("switch_account");
+            btnStart.Text = UiText.Get("start"); btnPause.Text = UiText.Get("pause"); btnRefresh.Text = UiText.Get("refresh"); switchAccount.Text = UiText.Get("switch_account");
         }
         private IdleMode SelectedMode => Settings.Default.IdlingModeWhitelist ? IdleMode.Whitelist :
             Settings.Default.fastMode ? IdleMode.Fast : Settings.Default.OnlyOneGameIdle ? IdleMode.Single :
             Settings.Default.OneThenMany ? IdleMode.OneThenMany : IdleMode.ManyThenOne;
         private bool Running => runStatus?.State == IdleRunState.Running || runStatus?.State == IdleRunState.Starting;
+        private IdleMode EffectiveMode => sessionTracker.Active ? runMode : SelectedMode;
         private List<IdleGame> GamesForRun()
         {
-            return AllBadges.Where(b => Settings.Default.IdlingModeWhitelist ||
-                (b.RemainingCard > 0 && (!Settings.Default.IdleOnlyPlayed || b.HoursPlayed > 0)))
-                .Where(b => Settings.Default.blacklist == null || !Settings.Default.blacklist.Contains(b.StringId))
+            var mode = EffectiveMode;
+            var onlyPlayed = sessionTracker.Active ? runOnlyPlayed : Settings.Default.IdleOnlyPlayed;
+            var blacklist = sessionTracker.Active ? runBlacklist : new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
+            return AllBadges.Where(b => mode == IdleMode.Whitelist ||
+                (b.RemainingCard > 0 && (!onlyPlayed || b.HoursPlayed > 0)))
+                .Where(b => !blacklist.Contains(b.StringId))
                 .Select(b => new IdleGame(b.AppId, b.Name, b.RemainingCard, b.HoursPlayed)).ToList();
         }
         private async Task<SteamReadResult<List<Badge>>> ScanAsync(CancellationToken token, bool forRun)
@@ -194,10 +212,10 @@ namespace IdleMasterExtended
                     return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.LoginRequired, UiText.Get("account_changed"));
                 }
                 SteamReadResult<List<Badge>> read;
-                if (Settings.Default.IdlingModeWhitelist)
+                if ((forRun ? runMode : SelectedMode) == IdleMode.Whitelist)
                 {
                     var list = new List<Badge>();
-                    foreach (string value in Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection())
+                    foreach (string value in forRun ? runWhitelist : (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>())
                         if (int.TryParse(value, out var id) && id > 0 && !list.Any(b => b.AppId == id))
                             list.Add(new Badge { AppId = id, Name = "App ID: " + id, RemainingCard = -1, HoursPlayed = 0 });
                     read = SteamReadResult<List<Badge>>.Succeeded(list);
@@ -206,11 +224,18 @@ namespace IdleMasterExtended
                 token.ThrowIfCancellationRequested();
                 if (!read.IsSuccess) { lastFailure = read.Status; if (read.Status == SteamReadStatus.LoginRequired) authenticated = false; return read; }
                 AllBadges = read.Value; snapshotSteamId = login.Value.SteamId;
-                if (Settings.Default.sort == "mostcards") AllBadges = AllBadges.OrderByDescending(b => b.RemainingCard).ToList();
-                else if (Settings.Default.sort == "leastcards") AllBadges = AllBadges.OrderBy(b => b.RemainingCard).ToList();
+                var sort = forRun ? runSort : Settings.Default.sort;
+                if (sort == "mostcards") AllBadges = AllBadges.OrderByDescending(b => b.RemainingCard).ToList();
+                else if (sort == "leastcards") AllBadges = AllBadges.OrderBy(b => b.RemainingCard).ToList();
                 lastFailure = null; ready = true;
-                if (forRun && !Settings.Default.IdlingModeWhitelist)
-                    statistics.checkCardRemaining((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
+                if (forRun && runMode != IdleMode.Whitelist)
+                {
+                    var previous = sessionTracker.CardsObserved;
+                    sessionTracker.Observe(AllBadges.Select(b => new IdleGame(b.AppId, b.Name, b.RemainingCard, b.HoursPlayed)));
+                    var observed = sessionTracker.CardsObserved - previous;
+                    if (observed > 0) statistics.increaseCardIdled((uint)Math.Min(uint.MaxValue, observed));
+                    statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
+                }
                 UpdateStateInfo();
                 return read;
             }
@@ -221,7 +246,7 @@ namespace IdleMasterExtended
             return await OnUiAsync(async () =>
             {
                 var read = await ScanAsync(token, true);
-                if (!read.IsSuccess) { ready = false; throw new InvalidOperationException(read.Message); }
+                if (!read.IsSuccess) { ready = false; throw new IdleRefreshException(read.Status, read.Message); }
                 return (IReadOnlyList<IdleGame>)GamesForRun();
             });
         }
@@ -250,7 +275,7 @@ namespace IdleMasterExtended
             SetMessage(UiText.Get("scanning"));
             try
             {
-                var read = await ScanAsync(scanCancellation.Token, false);
+                var read = await ScanAsync(scanCancellation.Token, sessionTracker.Active);
                 if (!read.IsSuccess) { SetMessage(read.Message); btnRefresh.Text = UiText.Get("retry"); }
                 else { SetMessage(GamesForRun().Count == 0 ? UiText.Get("no_cards") : UiText.Get("ready_to_start")); btnRefresh.Text = UiText.Get("refresh"); }
             }
@@ -287,10 +312,14 @@ namespace IdleMasterExtended
                 else
                 {
                     statistics = new Statistics(); elapsed.Reset();
+                    deferredRunSettings = false; runMode = SelectedMode; runOnlyPlayed = Settings.Default.IdleOnlyPlayed; runSort = Settings.Default.sort;
+                    runBlacklist = new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
+                    runWhitelist = (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>().ToList();
+                    sessionTracker.Start(GamesForRun(), runMode); summaryPanel.Dismiss();
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
                 runSteamId = snapshotSteamId;
-                await controller.StartAsync(GamesForRun(), runSteamId, SelectedMode, runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted);
+                await controller.StartAsync(GamesForRun(), runSteamId, EffectiveMode, runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { Logger.Exception(ex, "Start idle"); SetMessage(ex.Message); }
@@ -308,7 +337,7 @@ namespace IdleMasterExtended
             {
                 elapsed.Start(); tmrStatistics.Start();
                 if (Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
-                SetMessage(UiText.Get("running"));
+                SetMessage(status.ReadFailure.HasValue ? UiText.Get("running_retry") : UiText.Get("running"));
                 if (CurrentBadge != null) _ = LoadArtworkAsync(CurrentBadge.AppId);
             }
             else
@@ -318,7 +347,7 @@ namespace IdleMasterExtended
                 if (status.State == IdleRunState.Completed)
                 {
                     SetMessage(string.Format(UiText.Get("completion_summary"), statistics.getSessionCardIdled(), elapsed.Elapsed.ToString(@"hh\:mm\:ss")));
-                    if (Settings.Default.ShutdownWindowsOnDone) OfferShutdown();
+                    PresentSessionSummary(true);
                 }
                 else if (status.State == IdleRunState.Paused) SetMessage(UiText.Get("paused"));
                 else if (status.State == IdleRunState.Faulted) { ready = false; SetMessage(status.Error ?? UiText.Get("idle_failed")); btnRefresh.Text = UiText.Get("retry"); }
@@ -326,11 +355,26 @@ namespace IdleMasterExtended
             }
             UpdateStateInfo(); UpdateButtons(); UpdateCountdown();
         }
-        public void StopIdle()
+        public void StopIdle() { _ = StopSessionAsync(); }
+        private async Task StopSessionAsync()
         {
-            scanCancellation?.Cancel();
-            if (controller != null) _ = controller.StopAsync();
-            AllowSleep();
+            if (busy || closing || !sessionTracker.Active || controller == null) return;
+            busy = true; UpdateButtons(); scanCancellation?.Cancel();
+            try
+            {
+                await controller.StopAsync(); elapsed.Stop(); AllowSleep();
+                SetMessage(UiText.Get("session_stopped")); PresentSessionSummary(false);
+            }
+            finally { busy = false; UpdateButtons(); }
+        }
+        private void PresentSessionSummary(bool completed)
+        {
+            var summary = sessionTracker.Finish(completed, elapsed.Elapsed);
+            if (summary == null || closing) return;
+            if (deferredRunSettings) ready = false;
+            var offerShutdown = completed && Settings.Default.ShutdownWindowsOnDone;
+            if (offerShutdown) { Settings.Default.ShutdownWindowsOnDone = false; Settings.Default.Save(); }
+            summaryPanel.Present(summary, offerShutdown);
         }
         private async void btnPause_Click(object sender, EventArgs e)
         {
@@ -339,7 +383,7 @@ namespace IdleMasterExtended
         }
         private async void btnSkip_Click(object sender, EventArgs e)
         {
-            if (controller != null && Running && SelectedMode != IdleMode.Fast && SelectedMode != IdleMode.Whitelist) await controller.SkipAsync();
+            if (controller != null && Running && EffectiveMode != IdleMode.Fast && EffectiveMode != IdleMode.Whitelist) await controller.SkipAsync();
         }
         private async void btnResume_Click(object sender, EventArgs e) => await StartOrResumeAsync();
         private async Task SwitchAccountAsync()
@@ -350,6 +394,7 @@ namespace IdleMasterExtended
             {
                 scanCancellation?.Cancel();
                 if (controller != null) await controller.StopAsync();
+                sessionTracker.Abandon(); summaryPanel.Dismiss();
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
                 await session.SignOutAsync();
                 if (closing) return;
@@ -385,6 +430,7 @@ namespace IdleMasterExtended
             {
                 scanCancellation?.Cancel();
                 if (controller != null) await controller.StopAsync();
+                sessionTracker.Abandon(); summaryPanel.Dismiss();
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
                 await session.SignOutAsync();
                 if (closing) return;
@@ -399,8 +445,9 @@ namespace IdleMasterExtended
             if (closing || IsDisposed) return;
             btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && SteamAPI.IsSteamRunning();
             btnStart.Text = runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted ? UiText.Get("resume") : UiText.Get("start");
-            btnPause.Enabled = Running; btnRefresh.Enabled = !busy && !Running && session.IsInitialized;
-            btnSkip.Enabled = Running && SelectedMode != IdleMode.Fast && SelectedMode != IdleMode.Whitelist;
+            btnStop.Enabled = !busy && sessionTracker.Active;
+            btnPause.Enabled = !busy && Running; btnRefresh.Enabled = !busy && !Running && session.IsInitialized;
+            btnSkip.Enabled = !busy && Running && EffectiveMode != IdleMode.Fast && EffectiveMode != IdleMode.Whitelist;
             pauseIdlingToolStripMenuItem.Enabled = btnPause.Enabled; resumeIdlingToolStripMenuItem.Enabled = btnStart.Enabled;
             skipGameToolStripMenuItem.Enabled = btnSkip.Enabled; blacklistCurrentGameToolStripMenuItem.Enabled = Running && CurrentBadge != null;
             settingsToolStripMenuItem.Enabled = !busy; whitelistToolStripMenuItem.Enabled = blacklistToolStripMenuItem.Enabled = !busy;
@@ -416,10 +463,10 @@ namespace IdleMasterExtended
         {
             if (closing || IsDisposed) return;
             var games = GamesForRun();
-            lblDrops.Text = snapshotSteamId == 0 ? UiText.Get("cards_not_scanned") : Settings.Default.IdlingModeWhitelist ? UiText.Get("whitelist_mode") : string.Format(UiText.Get("cards_remaining"), Math.Max(0, games.Sum(g => g.RemainingCards)));
+            lblDrops.Text = snapshotSteamId == 0 ? UiText.Get("cards_not_scanned") : EffectiveMode == IdleMode.Whitelist ? UiText.Get("whitelist_mode") : string.Format(UiText.Get("cards_remaining"), Math.Max(0, games.Sum(g => g.RemainingCards)));
             lblIdle.Text = string.Format(UiText.Get("games_available"), games.Count, runStatus?.ActiveGames.Count ?? 0);
             GamesState.BeginUpdate(); GamesState.Items.Clear();
-            foreach (var badge in AllBadges.Where(b => Settings.Default.IdlingModeWhitelist || b.RemainingCard > 0))
+            foreach (var badge in AllBadges.Where(b => EffectiveMode == IdleMode.Whitelist || b.RemainingCard > 0))
             {
                 var row = new ListViewItem((badge.InIdle ? "> " : "") + badge.Name);
                 row.SubItems.Add(badge.HoursPlayed.ToString("0.##")); GamesState.Items.Add(row);
@@ -481,10 +528,13 @@ namespace IdleMasterExtended
         }
         private void CheckSteam()
         {
-            var available = SteamAPI.IsSteamRunning();
+            UpdateSteamClientStatus(SteamAPI.IsSteamRunning());
+        }
+        private void UpdateSteamClientStatus(bool available)
+        {
             lblSteamStatus.Text = available ? localization.strings.steam_running : localization.strings.steam_notrunning;
             picSteamStatus.Image = StatusImage(available);
-            if (!available && Running && controller != null) _ = controller.PauseAsync();
+            // The verified helper context owns account/lifetime checks. A broad client probe must not pause a live run.
             UpdateButtons();
         }
         private void tmrCheckSteam_Tick(object sender, EventArgs e) => CheckSteam();
@@ -518,40 +568,48 @@ namespace IdleMasterExtended
         {
             BackColor = Settings.Default.customTheme ? Settings.Default.colorBgd : Settings.Default.colorBgdOriginal;
             ForeColor = Settings.Default.customTheme ? Settings.Default.colorTxt : Settings.Default.colorTxtOriginal;
-            foreach (var button in new[] { btnStart, btnPause, btnSkip, btnRefresh }) { button.BackColor = BackColor; button.ForeColor = ForeColor; button.FlatStyle = Settings.Default.customTheme ? FlatStyle.Flat : FlatStyle.Standard; }
+            foreach (var button in new[] { btnStart, btnPause, btnSkip, btnStop, btnRefresh }) { button.BackColor = BackColor; button.ForeColor = ForeColor; button.FlatStyle = Settings.Default.customTheme ? FlatStyle.Flat : FlatStyle.Standard; }
             GamesState.BackColor = BackColor; GamesState.ForeColor = ForeColor; mnuTop.BackColor = BackColor; mnuTop.ForeColor = ForeColor;
             ssFooter.BackColor = BackColor; ssFooter.ForeColor = ForeColor;
+            summaryPanel.ApplyTheme(BackColor, ForeColor, Settings.Default.customTheme);
             picCookieStatus.Image = StatusImage(authenticated); picSteamStatus.Image = StatusImage(SteamAPI.IsSteamRunning());
             foreach (var link in new[] { lnkSignIn, lnkResetCookies, switchAccount, lblCurrentStatus, lblGameName, lnkLatestRelease })
                 link.LinkColor = link.ForeColor = Settings.Default.customTheme ? Color.GhostWhite : Color.Blue;
         }
-        private async Task EditAndRefreshAsync(Action edit)
+        private async Task EditAndRefreshAsync(Func<DialogResult> edit)
         {
             if (busy || closing) return;
-            busy = true; ready = false; UpdateButtons();
+            busy = true; UpdateButtons();
+            var saved = false;
             try
             {
-                scanCancellation?.Cancel();
-                if (controller != null) await controller.StopAsync();
-                if (closing) return;
-                edit(); ApplyTheme();
+                saved = edit() == DialogResult.OK;
+                if (saved) { if (sessionTracker.Active) deferredRunSettings = true; SetLanguage(); LocalizeMenus(); ApplyTheme(); }
             }
             catch (Exception ex) { Logger.Exception(ex, "Edit settings"); SetMessage(UiText.Get("scan_failed")); }
             finally { busy = false; UpdateButtons(); }
-            if (!closing) await RefreshManuallyAsync();
+            if (!saved || closing) return;
+            // Freeze scheduling/filter settings for the entire session. Appearance and sleep
+            // preference can change immediately without tearing down the active helpers.
+            if (sessionTracker.Active)
+            {
+                if (Running && Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
+                else AllowSleep();
+                SetMessage(UiText.Get("settings_next_session"));
+            }
+            else await RefreshManuallyAsync();
         }
         private async void settingsToolStripMenuItem_Click(object sender, EventArgs e)
-            => await EditAndRefreshAsync(() => { using (var dialog = new frmSettings()) dialog.ShowDialog(this); });
+            => await EditAndRefreshAsync(() => { using (var dialog = new frmSettings()) return dialog.ShowDialog(this); });
         private async void blacklistToolStripMenuItem_Click(object sender, EventArgs e)
-            => await EditAndRefreshAsync(() => { using (var dialog = new frmBlacklist()) dialog.ShowDialog(this); });
+            => await EditAndRefreshAsync(() => { using (var dialog = new frmBlacklist()) return dialog.ShowDialog(this); });
         private async void whitelistToolStripMenuItem_Click(object sender, EventArgs e)
-            => await EditAndRefreshAsync(() => { using (var dialog = new frmWhitelist(this)) dialog.ShowDialog(this); });
+            => await EditAndRefreshAsync(() => { using (var dialog = new frmWhitelist(this)) return dialog.ShowDialog(this); });
         private async void blacklistCurrentGameToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            if (CurrentBadge == null) return;
+            if (CurrentBadge == null || !Running || busy) return;
             Settings.Default.blacklist.Add(CurrentBadge.StringId); Settings.Default.Save();
-            if (controller != null) await controller.StopAsync();
-            await RefreshManuallyAsync();
+            if (controller != null) await controller.SkipAsync();
         }
         private void pauseIdlingToolStripMenuItem_Click(object sender, EventArgs e) => btnPause.PerformClick();
         private void resumeIdlingToolStripMenuItem_Click(object sender, EventArgs e) => btnStart.PerformClick();
@@ -584,11 +642,11 @@ namespace IdleMasterExtended
             return result;
         }
         private static void AllowSleep() => NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous);
-        private void OfferShutdown()
+        private void ScheduleShutdown()
         {
-            Settings.Default.ShutdownWindowsOnDone = false; Settings.Default.Save();
-            if (MessageBox.Show("Card idling is complete. Shut down Windows in five minutes?", Text, MessageBoxButtons.YesNo) == DialogResult.Yes)
-                Process.Start(new ProcessStartInfo("shutdown.exe", "/s /t 300") { UseShellExecute = false, CreateNoWindow = true });
+            // This is a user-clicked summary action; completion itself never opens a system dialog.
+            try { Process.Start(new ProcessStartInfo("shutdown.exe", "/s /t 300") { UseShellExecute = false, CreateNoWindow = true }); summaryPanel.Dismiss(); }
+            catch (Exception ex) { Logger.Exception(ex, "Schedule shutdown"); SetMessage(UiText.Get("shutdown_failed")); }
         }
     }
 }

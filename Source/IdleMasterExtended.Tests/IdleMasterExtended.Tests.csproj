@@ -28,6 +28,9 @@
     <Reference Include="System.Net.Http" />
     <Reference Include="System.Windows.Forms" />
     <Compile Include="Program.cs" />
+    <Compile Include="..\..\steam-idle Source\steam-idle\HelperConnectionGuard.cs">
+      <Link>HelperConnectionGuard.cs</Link>
+    </Compile>
     <Compile Include="..\..\tests\*.cs">
       <Link>%(Filename)%(Extension)</Link>
     </Compile>

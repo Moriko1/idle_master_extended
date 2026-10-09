@@ -82,6 +82,25 @@ namespace IdleMasterExtended.Tests
                         if (measured.Height > status.ClientSize.Height)
                             issues.Add(suffix + ": long failure status requires " + measured.Height +
                                 "px, available " + status.ClientSize.Height + "px.");
+                        var tracker = new IdleSessionTracker();
+                        tracker.Start(new[] { new IdleGame(10, "Game", 4, 1) }, IdleMode.Single);
+                        tracker.Observe(new[] { new IdleGame(10, "Game", 2, 2) });
+                        var summary = Field<SessionSummaryPanel>(form, "summaryPanel");
+                        summary.Present(tracker.Finish(false, TimeSpan.FromMinutes(17)));
+                        Test.Assert(form.Controls.GetChildIndex(summary) == 0, "Summary must be in front of every main-window sibling.");
+                        // WinForms DrawToBitmap reverses sibling paint order. Composite the
+                        // frontmost child explicitly so this synthetic image matches its z-order.
+                        SaveSummary(form, summary, Path.Combine(output, "ui-main-" + suffix + "-summary.png"));
+                        Test.Assert(form.ClientRectangle.Contains(summary.Bounds), "Summary must fit within the main window.");
+                        foreach (Control control in summary.Controls)
+                        {
+                            Test.Assert(summary.ClientRectangle.Contains(control.Bounds), "Summary controls must fit at each scale.");
+                            if (control is Label)
+                            {
+                                var size = TextRenderer.MeasureText(control.Text, control.Font, new Size(control.Width, int.MaxValue), TextFormatFlags.WordBreak);
+                                if (size.Height > control.Height) issues.Add(suffix + ": summary text clips.");
+                            }
+                        }
                         Field<System.Windows.Forms.Timer>(form, "displayTimer").Stop();
                         Field<System.Windows.Forms.Timer>(form, "displayTimer").Dispose();
                         Field<SteamSessionService>(form, "session").CloseAsync().GetAwaiter().GetResult();
@@ -122,13 +141,13 @@ namespace IdleMasterExtended.Tests
                 new[] { "Synthetic scaling render only; actual display DPI and Steam sign-in/idling are unverified." }
                 .Concat(issues.Count == 0 ? new[] { "PASS: controls and long failure status fit all 8 variants." } : issues.ToArray()));
             foreach (var issue in issues) Console.WriteLine("LAYOUT: " + issue);
-            Console.WriteLine("Rendered 20 invisible-window PNGs under " + output);
+            Console.WriteLine("Rendered 28 invisible-window PNGs under " + output);
             Test.Assert(issues.Count == 0, "Desktop layout issues were found; see artifacts/ui-render-report.txt.");
         }
 
         private static void CheckLayout(frmMain form, string name, List<string> issues)
         {
-            var buttons = new[] { "btnStart", "btnPause", "btnSkip", "btnRefresh" }
+            var buttons = new[] { "btnStart", "btnPause", "btnSkip", "btnStop", "btnRefresh" }
                 .Select(value => Field<Button>(form, value)).ToArray();
             foreach (var button in buttons)
             {
@@ -149,6 +168,24 @@ namespace IdleMasterExtended.Tests
                 issues.Add(name + ": sign-in link is outside the client area.");
             if (signIn.Bounds.IntersectsWith(account.Bounds))
                 issues.Add(name + ": account status overlaps the sign-in link.");
+        }
+
+        private static void SaveSummary(Form form, SessionSummaryPanel panel, string path)
+        {
+            panel.Dismiss();
+            using (var image = new Bitmap(form.Width, form.Height))
+            using (var popup = new Bitmap(panel.Width, panel.Height))
+            {
+                form.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
+                panel.Present(panel.Summary);
+                panel.DrawToBitmap(popup, new Rectangle(Point.Empty, popup.Size));
+                var clientOrigin = form.PointToScreen(Point.Empty);
+                var windowOrigin = form.Location;
+                using (var graphics = Graphics.FromImage(image))
+                    graphics.DrawImageUnscaled(popup, clientOrigin.X - windowOrigin.X + panel.Left,
+                        clientOrigin.Y - windowOrigin.Y + panel.Top);
+                image.Save(path, ImageFormat.Png);
+            }
         }
 
         private static void Save(Form form, string path)

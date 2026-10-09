@@ -168,16 +168,18 @@ namespace steam_idle
                         return;
                     }
                     var steamId = SteamUser.GetSteamID().m_SteamID;
-                    if (options.ExpectedSteamId.HasValue && steamId != options.ExpectedSteamId.Value)
+                    var contextFailure = HelperConnectionGuard.Check(false, SteamAPI.IsSteamRunning(),
+                        options.ExpectedSteamId, steamId, false);
+                    if (contextFailure != null)
                     {
-                        status.Send("ERROR ACCOUNT_MISMATCH");
+                        status.Send("ERROR " + contextFailure);
                         Environment.ExitCode = 7;
                         return;
                     }
 
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-                    using (var form = new FormSteamIdle(options.AppId, options.ExpectedSteamId, parent, reason =>
+                    using (var form = new FormSteamIdle(options.AppId, options.ExpectedSteamId ?? steamId, parent, reason =>
                     {
                         status.Send("ERROR " + reason);
                         Environment.ExitCode = 8;

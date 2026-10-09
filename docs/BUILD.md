@@ -5,7 +5,7 @@ Use Windows 10/11 x64, Visual Studio 2022 or newer with the .NET desktop workloa
 From the repository root:
 
     python scripts/build.py
-    python scripts/build.py --package --version 1.12.0-preview.2
+    python scripts/build.py --package --version 1.12.0-preview.3
 
 The script restores pinned NuGet packages, builds the helper before the application, and runs the x64 regression console. Packaging requires a clean Git checkout so the source ZIP corresponds to the binaries. The portable ZIP, source ZIP, and SHA256SUMS.txt are written to dist/.
 

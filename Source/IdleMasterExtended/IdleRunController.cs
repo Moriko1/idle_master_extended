@@ -9,6 +9,19 @@ namespace IdleMasterExtended
     public enum IdleMode { Single, OneThenMany, ManyThenOne, Fast, Whitelist }
     public enum IdleRunState { Stopped, Starting, Running, Paused, Completed, Faulted }
 
+    /// <summary>Classifies a scan failure without discarding the previous verified game queue.</summary>
+    public sealed class IdleRefreshException : Exception
+    {
+        public SteamReadStatus Status { get; private set; }
+
+        public IdleRefreshException(SteamReadStatus status, string message) : base(message)
+        {
+            if (status == SteamReadStatus.Success || !Enum.IsDefined(typeof(SteamReadStatus), status))
+                throw new ArgumentOutOfRangeException(nameof(status));
+            Status = status;
+        }
+    }
+
     public sealed class IdleGame
     {
         public int AppId { get; private set; }
@@ -37,9 +50,11 @@ namespace IdleMasterExtended
         public IReadOnlyList<IdleGame> RemainingGames { get; private set; }
         public DateTimeOffset? NextCheckAt { get; private set; }
         public string Error { get; private set; }
+        public SteamReadStatus? ReadFailure { get; private set; }
 
         internal IdleRunStatus(IdleRunState state, IdleMode mode, IEnumerable<IdleGame> active,
-            IEnumerable<IdleGame> remaining, DateTimeOffset? nextCheckAt, string error)
+            IEnumerable<IdleGame> remaining, DateTimeOffset? nextCheckAt, string error,
+            SteamReadStatus? readFailure = null)
         {
             State = state;
             Mode = mode;
@@ -47,6 +62,7 @@ namespace IdleMasterExtended
             RemainingGames = remaining.ToList().AsReadOnly();
             NextCheckAt = nextCheckAt;
             Error = error;
+            ReadFailure = readFailure;
         }
     }
 
@@ -196,6 +212,7 @@ namespace IdleMasterExtended
         private async Task RunAsync(CancellationToken token)
         {
             string error = null;
+            SteamReadStatus? readFailure = null;
             var finished = false;
             try
             {
@@ -238,13 +255,17 @@ namespace IdleMasterExtended
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception ex) { error = ex.Message; }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                readFailure = (ex as IdleRefreshException)?.Status;
+            }
             finally
             {
                 StopHelpers();
                 if (!token.IsCancellationRequested && !disposed)
                 {
-                    if (error != null) Publish(IdleRunState.Faulted, null, error);
+                    if (error != null) Publish(IdleRunState.Faulted, null, error, readFailure);
                     else if (finished) Publish(IdleRunState.Completed);
                 }
             }
@@ -312,6 +333,30 @@ namespace IdleMasterExtended
 
         private async Task RefreshAsync(CancellationToken token)
         {
+            var failures = 0;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    await RefreshOnceAsync(token).ConfigureAwait(false);
+                    Publish(IdleRunState.Running);
+                    return;
+                }
+                catch (IdleRefreshException ex) when (ex.Status == SteamReadStatus.TransientFailure ||
+                    ex.Status == SteamReadStatus.MalformedPage)
+                {
+                    // Failed reads never prove that cards have finished. Keep the current
+                    // helpers alive and retry one scan at a time, up to a five-minute cadence.
+                    failures = Math.Min(failures + 1, 5);
+                    var delay = TimeSpan.FromSeconds(Math.Min(300, 30 * Math.Pow(2, failures - 1)));
+                    await WaitAsync(delay, token, ex.Message, ex.Status).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private async Task RefreshOnceAsync(CancellationToken token)
+        {
             using (var phase = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
                 var refresh = refreshGamesAsync(phase.Token);
@@ -331,7 +376,8 @@ namespace IdleMasterExtended
                     var refreshed = await AwaitCancelableAsync(refresh, token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
                     if (refreshed == null || refreshed.Any(game => game == null))
-                        throw new InvalidOperationException("Steam returned an invalid badge scan result.");
+                        throw new IdleRefreshException(SteamReadStatus.MalformedPage,
+                            "Steam returned an invalid badge scan result.");
                     lock (sync)
                     {
                         token.ThrowIfCancellationRequested();
@@ -349,10 +395,11 @@ namespace IdleMasterExtended
                 .GroupBy(game => game.AppId).Select(group => group.First()).ToList();
         }
 
-        private async Task WaitAsync(TimeSpan duration, CancellationToken token)
+        private async Task WaitAsync(TimeSpan duration, CancellationToken token, string error = null,
+            SteamReadStatus? readFailure = null)
         {
             token.ThrowIfCancellationRequested();
-            Publish(IdleRunState.Running, clock.UtcNow.Add(duration));
+            Publish(IdleRunState.Running, clock.UtcNow.Add(duration), error, readFailure);
             using (var phase = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
                 var delay = clock.DelayAsync(duration, phase.Token);
@@ -401,10 +448,11 @@ namespace IdleMasterExtended
             }
         }
 
-        private void Publish(IdleRunState state, DateTimeOffset? nextCheck = null, string error = null)
+        private void Publish(IdleRunState state, DateTimeOffset? nextCheck = null, string error = null,
+            SteamReadStatus? readFailure = null)
         {
             IdleRunStatus status;
-            lock (sync) status = new IdleRunStatus(state, mode, active, games, nextCheck, error);
+            lock (sync) status = new IdleRunStatus(state, mode, active, games, nextCheck, error, readFailure);
             snapshot = status;
             var handlers = StatusChanged;
             if (handlers == null) return;

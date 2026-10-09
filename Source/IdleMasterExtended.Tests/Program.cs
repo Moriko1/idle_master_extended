@@ -21,7 +21,9 @@ namespace IdleMasterExtended.Tests
                 Test.RunAsync("Idle run supervision and cancellation", IdleRunTests.RunAllAsync);
                 Test.Run("Settings save and cancellation", SettingsTests.RunAll);
                 Test.Run("Steam session identity", SessionTests.RunAll);
-                Console.WriteLine("PASS: all 4 regression suites.");
+                Test.Run("Session summary and nonactivating controls", SessionSummaryTests.RunAll);
+                Test.Run("Helper Steam connection resilience", HelperConnectionTests.RunAll);
+                Console.WriteLine("PASS: all 6 regression suites.");
                 return 0;
             }
             catch (Exception exception)

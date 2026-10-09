@@ -29,7 +29,11 @@ namespace steam_idle
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
             WindowState = FormWindowState.Minimized;
             // This helper needs a message loop, not remote game artwork or a visible window.
-            disconnected = Callback<SteamServersDisconnected_t>.Create(message => Fail("STEAM_DISCONNECTED"));
+            // BLoggedOn and this callback describe the back-end connection, not whether
+            // the local Steam account changed. Steam reconnects itself while this helper
+            // retains the same verified client account.
+            disconnected = Callback<SteamServersDisconnected_t>.Create(message =>
+                CheckContext(IsConfirmedLogoff(message.m_eResult)));
             connected = Callback<SteamServersConnected_t>.Create(message => CheckContext());
             heartbeat = new Timer { Interval = 50 };
             heartbeat.Tick += Tick;
@@ -55,17 +59,30 @@ namespace steam_idle
             catch { Fail("INITIALIZATION_FAILED"); }
         }
 
-        private void CheckContext()
+        private void CheckContext(bool confirmedLogoff = false)
         {
             if (closing) return;
             try
             {
-                if (parent != null && parent.HasExited) { Fail("PARENT_EXITED"); return; }
-                if (!SteamAPI.IsSteamRunning() || !SteamUser.BLoggedOn()) { Fail("STEAM_OFFLINE"); return; }
-                if (expectedSteamId.HasValue && SteamUser.GetSteamID().m_SteamID != expectedSteamId.Value)
-                    Fail("ACCOUNT_MISMATCH");
+                var parentExited = parent != null && parent.HasExited;
+                var clientRunning = !parentExited && SteamAPI.IsSteamRunning();
+                var steamId = clientRunning ? SteamUser.GetSteamID().m_SteamID : 0;
+                var failure = HelperConnectionGuard.Check(parentExited, clientRunning,
+                    expectedSteamId, steamId, confirmedLogoff);
+                if (failure != null) Fail(failure);
             }
             catch { Fail("STEAM_OFFLINE"); }
+        }
+
+        private static bool IsConfirmedLogoff(EResult result)
+        {
+            // These explicitly invalidate a login; generic connection failures are
+            // allowed to reconnect when GetSteamID still proves the same local user.
+            return result == EResult.k_EResultNotLoggedOn ||
+                result == EResult.k_EResultLoggedInElsewhere ||
+                result == EResult.k_EResultLogonSessionReplaced ||
+                result == EResult.k_EResultInvalidPassword ||
+                result == EResult.k_EResultAccountDisabled;
         }
 
         private void Fail(string reason)

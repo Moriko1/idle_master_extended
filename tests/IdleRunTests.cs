@@ -21,6 +21,10 @@ namespace IdleMasterExtended.Tests
             await ResumeRescanPreservesSkippedAsync();
             await HelperFailureReleasesPeersAsync();
             await ScanFailurePreservesQueueAsync();
+            await RecoverableScansKeepHelpersAndRetryAsync();
+            await InvalidScanRetriesWithoutCompletingAsync();
+            await PauseAndStopCancelScanRetriesAsync();
+            await ExpiredLoginStopsSafelyAsync();
             await EmptyScanCompletesAsync();
             await HelperFailureDuringScanAsync();
             await PauseCancelsPendingScanAsync();
@@ -194,6 +198,140 @@ namespace IdleMasterExtended.Tests
                 Assert(factory.ActiveCount == 0 && run.Snapshot.RemainingGames.Count == 2,
                     "An unsuccessful scan must not become an empty completed queue.");
                 Assert(run.Snapshot.Error == "Steam is temporarily unavailable.", "The scan error reaches the UI.");
+            }
+        }
+
+        private static async Task RecoverableScansKeepHelpersAndRetryAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var scans = 0;
+            var activeScans = 0;
+            var maximumScans = 0;
+            using (var run = new IdleRunController(factory, async token =>
+            {
+                var active = Interlocked.Increment(ref activeScans);
+                maximumScans = Math.Max(maximumScans, active);
+                var attempt = Interlocked.Increment(ref scans);
+                try
+                {
+                    await Task.Yield();
+                    token.ThrowIfCancellationRequested();
+                    if (attempt <= 5)
+                        throw new IdleRefreshException(
+                            attempt % 2 == 0 ? SteamReadStatus.MalformedPage : SteamReadStatus.TransientFailure,
+                            "Steam could not be read.");
+                    if (attempt == 6)
+                        return new[] { Game(1, 1, 2), Game(2, 0, 2) };
+                    return new IdleGame[0];
+                }
+                finally { Interlocked.Decrement(ref activeScans); }
+            }, clock))
+            {
+                await run.StartAsync(new[] { Game(1), Game(2) }, SteamId, IdleMode.ManyThenOne);
+                await Until(() => clock.PendingCount == 1, "recoverable scan setup");
+                clock.ReleaseNext();
+                var retrySeconds = new[] { 30, 60, 120, 240, 300 };
+                for (var attempt = 1; attempt <= retrySeconds.Length; attempt++)
+                {
+                    var expectedAttempts = attempt;
+                    await Until(() => scans == expectedAttempts && clock.PendingCount == 1,
+                        "recoverable scan retry");
+                    Assert(run.Snapshot.State == IdleRunState.Running && factory.ActiveCount == 2 &&
+                        factory.StartCount == 2, "A read failure keeps the existing helpers idling.");
+                    Assert(run.Snapshot.RemainingGames.Count == 2 &&
+                        run.Snapshot.RemainingGames.Sum(game => game.RemainingCards) == 4,
+                        "Transient and malformed reads keep every previously verified count.");
+                    Assert(run.Snapshot.ReadFailure.HasValue && run.Snapshot.Error == "Steam could not be read.",
+                        "The running status exposes a recoverable read failure.");
+                    Assert(clock.NextDelay == TimeSpan.FromSeconds(retrySeconds[attempt - 1]),
+                        "Retry backoff is bounded at five minutes.");
+                    clock.ReleaseNext();
+                }
+                await Until(() => scans == 6 && clock.PendingCount == 1 && run.Snapshot.ActiveGames.Count == 1,
+                    "successful scan after outages");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.ReadFailure == null &&
+                    run.Snapshot.Error == null && run.Snapshot.RemainingGames.Single().RemainingCards == 1,
+                    "Recovery clears the warning and applies the complete verified queue.");
+                Assert(factory.StartCount == 2 && factory.ActiveCount == 1 && maximumScans == 1,
+                    "Recovery reuses the surviving helper and never overlaps badge reads.");
+                clock.ReleaseNext();
+                await Until(() => run.Snapshot.State == IdleRunState.Completed, "verified empty scan after recovery");
+                Assert(scans == 7 && factory.ActiveCount == 0,
+                    "Only a successful empty scan completes the recovered run and stops helpers.");
+            }
+        }
+
+        private static async Task InvalidScanRetriesWithoutCompletingAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            using (var run = new IdleRunController(factory,
+                token => Task.FromResult<IReadOnlyList<IdleGame>>(null), clock))
+            {
+                await run.StartAsync(new[] { Game(1) }, SteamId, IdleMode.Single);
+                await Until(() => clock.PendingCount == 1, "invalid scan setup");
+                clock.ReleaseNext();
+                await Until(() => clock.PendingCount == 1 &&
+                    run.Snapshot.ReadFailure == SteamReadStatus.MalformedPage, "invalid scan retry");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Count == 1 &&
+                    factory.ActiveCount == 1, "An invalid null scan cannot become zero cards or completion.");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task PauseAndStopCancelScanRetriesAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var scans = 0;
+            using (var run = new IdleRunController(factory, token =>
+            {
+                Interlocked.Increment(ref scans);
+                return Task.FromException<IReadOnlyList<IdleGame>>(new IdleRefreshException(
+                    SteamReadStatus.TransientFailure, "Steam is temporarily unavailable."));
+            }, clock))
+            {
+                var games = new[] { Game(1), Game(2) };
+                await run.StartAsync(games, SteamId, IdleMode.ManyThenOne);
+                await Until(() => clock.PendingCount == 1, "pause retry setup");
+                clock.ReleaseNext();
+                await Until(() => scans == 1 && clock.PendingCount == 1, "retry before pause");
+                await run.PauseAsync();
+                var starts = factory.StartCount;
+                await Task.Delay(30);
+                Assert(run.Snapshot.State == IdleRunState.Paused && factory.ActiveCount == 0 &&
+                    clock.PendingCount == 0 && scans == 1 && factory.StartCount == starts,
+                    "Pause cancels the retry delay and leaves no late scan or helper launch.");
+                await run.ResumeAsync();
+                await Until(() => clock.PendingCount == 1, "resumed retry setup");
+                clock.ReleaseNext();
+                await Until(() => scans == 2 && clock.PendingCount == 1, "retry before stop");
+                await run.StopAsync();
+                starts = factory.StartCount;
+                await Task.Delay(30);
+                Assert(run.Snapshot.State == IdleRunState.Stopped && factory.ActiveCount == 0 &&
+                    clock.PendingCount == 0 && scans == 2 && factory.StartCount == starts,
+                    "Stop cancels the retry and preserves manual restart control.");
+            }
+        }
+
+        private static async Task ExpiredLoginStopsSafelyAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            using (var run = new IdleRunController(factory, token =>
+                Task.FromException<IReadOnlyList<IdleGame>>(new IdleRefreshException(
+                    SteamReadStatus.LoginRequired, "Steam sign-in expired.")), clock))
+            {
+                await run.StartAsync(new[] { Game(1), Game(2) }, SteamId, IdleMode.ManyThenOne);
+                await Until(() => clock.PendingCount == 1, "expired login setup");
+                clock.ReleaseNext();
+                await Until(() => run.Snapshot.State == IdleRunState.Faulted, "expired login stop");
+                Assert(factory.ActiveCount == 0 && clock.PendingCount == 0 &&
+                    run.Snapshot.RemainingGames.Count == 2 &&
+                    run.Snapshot.ReadFailure == SteamReadStatus.LoginRequired,
+                    "Lost account authentication stops helpers safely while retaining the queue and reason.");
             }
         }
 

@@ -13,7 +13,7 @@ It keeps the existing WinForms interface, idling modes, filters, themes and tran
 2. Extract every file to a folder, then open **IdleMasterExtended.exe**.
 3. Keep Steam open and signed in. Select **Sign in** and complete Steam's official login page.
 4. Wait for the card scan, then press **Start**. Scanning and signing in do not start idling.
-5. **Pause** stops the idle helpers. **Resume** requires a manual click. Completion leaves a summary visible.
+5. **Pause** temporarily stops helpers; **Resume** requires a manual click. **Stop** ends the session. Stop and completion show a summary inside Idle Master without activating or restoring its window.
 
 Requirements: Windows 10/11 x64, .NET Framework 4.8, Steam, and Microsoft WebView2 Evergreen Runtime.
 The ZIP contains the app and its libraries; it uses the installed browser runtime.
@@ -27,12 +27,12 @@ Your Community login must match the account in the running Steam client.
 ## Everyday controls
 
 - **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
-- Temporary network errors preserve the last successful counts and stop interrupted runs.
+- Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
 - Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings.
 - Whitelist mode has no automatic card completion; stop it manually. At most 30 games run together.
-- Settings changes apply only on **Save**. **Cancel** discards edits.
+- Settings changes apply only on **Save**. **Cancel** discards edits and leaves idling alone. During a session, appearance and sleep settings apply immediately; mode and filter changes apply to the next session.
 - Closing the app stops its helpers. Sleep prevention applies only while idling.
-- Shutdown after completion remains an optional one-run setting, disabled by default.
+- Shutdown after completion remains an optional one-run setting, disabled by default. Its completion summary offers a shutdown button; completion does not open a system prompt.
 
 The browser session and diagnostic logs are stored under
 `%LocalAppData%\IdleMasterExtended\Moriko1`.
