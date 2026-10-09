@@ -50,8 +50,9 @@ namespace IdleMasterExtended
 
         private void SetVersion()
         {
-            var version = Assembly.GetExecutingAssembly().GetName().Version;
-            linkLabelVersion.Text = string.Format("Idle Master Extended v{0}.{1}.{2}", version.Major, version.Minor, version.Build);
+            var assembly = Assembly.GetExecutingAssembly();
+            var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? assembly.GetName().Version.ToString(3);
+            linkLabelVersion.Text = "Idle Master Extended v" + version;
         }
 
         private void linkLabelVersion_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)

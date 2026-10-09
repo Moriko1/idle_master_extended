@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Collections.Generic;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -61,17 +62,16 @@ namespace IdleMasterExtended
                 if (!IsInitialized) return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
                 var browserCookies = await Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
                 token.ThrowIfCancellationRequested();
-                var login = browserCookies.FirstOrDefault(c => c.Name == "steamLoginSecure");
+                var login = browserCookies.FirstOrDefault(c => c.Name == "steamLoginSecure" && IsCommunityCookie(c.Name, c.Domain));
                 if (login == null || !TryReadCookieIdentity(login.Value, out var expected))
                     return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
-                var jar = new CookieContainer();
-                foreach (var cookie in browserCookies)
-                {
-                    if (!cookie.Domain.TrimStart('.').Equals("steamcommunity.com", StringComparison.OrdinalIgnoreCase)) continue;
-                    jar.Add(new Cookie(cookie.Name, cookie.Value, cookie.Path, cookie.Domain)
-                    { Secure = cookie.IsSecure, HttpOnly = cookie.IsHttpOnly });
-                }
-                var candidate = new SteamHttpClient(jar);
+                var imported = CreateCommunityCookieJar(browserCookies
+                    .Where(c => IsCommunityCookie(c.Name, c.Domain))
+                    .Select(c => new Cookie(c.Name, c.Value, c.Path, c.Domain)
+                    { Secure = c.IsSecure, HttpOnly = c.IsHttpOnly }));
+                if (!imported.IsSuccess)
+                    return SteamReadResult<SteamSession>.Failed(imported.Status, imported.Message);
+                var candidate = new SteamHttpClient(imported.Value);
                 try
                 {
                     var response = await candidate.GetAsync("https://steamcommunity.com/my/?l=english", token);
@@ -91,6 +91,30 @@ namespace IdleMasterExtended
                 return SteamReadResult<SteamSession>.Failed(SteamReadStatus.TransientFailure, "Steam is temporarily unavailable. Retry when connected.");
             }
             finally { gate.Release(); }
+        }
+        internal static bool IsCommunityCookie(string name, string domain)
+        {
+            // Browser preference/analytics cookies can contain commas that .NET's CookieContainer rejects.
+            // Community reads need only these authentication cookies. Never transform their token values.
+            return string.Equals((domain ?? "").TrimStart('.'), "steamcommunity.com", StringComparison.OrdinalIgnoreCase) &&
+                (name == "steamLoginSecure" || name == "sessionid" || name == "steamparental");
+        }
+        internal static SteamReadResult<CookieContainer> CreateCommunityCookieJar(IEnumerable<Cookie> browserCookies)
+        {
+            var jar = new CookieContainer();
+            try
+            {
+                foreach (var cookie in browserCookies)
+                    if (cookie != null && IsCommunityCookie(cookie.Name, cookie.Domain)) jar.Add(cookie);
+            }
+            catch (CookieException)
+            {
+                return SteamReadResult<CookieContainer>.Failed(SteamReadStatus.MalformedPage,
+                    "The saved Steam sign-in could not be read. Close this window and use Switch account to sign in again.");
+            }
+            if (jar.GetCookies(new Uri("https://steamcommunity.com/"))["steamLoginSecure"] == null)
+                return SteamReadResult<CookieContainer>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
+            return SteamReadResult<CookieContainer>.Succeeded(jar);
         }
         internal static bool TryReadCookieIdentity(string value, out ulong steamId)
         {

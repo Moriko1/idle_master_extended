@@ -5,7 +5,7 @@ Use Windows 10/11 x64, Visual Studio 2022 or newer with the .NET desktop workloa
 From the repository root:
 
     python scripts/build.py
-    python scripts/build.py --package --version 1.12.0-preview.1
+    python scripts/build.py --package --version 1.12.0-preview.2
 
 The script restores pinned NuGet packages, builds the helper before the application, and runs the x64 regression console. Packaging requires a clean Git checkout so the source ZIP corresponds to the binaries. The portable ZIP, source ZIP, and SHA256SUMS.txt are written to dist/.
 
@@ -14,6 +14,10 @@ Run IdleMasterExtended.exe from the extracted portable ZIP. The installed Micros
 ## Synthetic layout checks
 
 After building, run Source/IdleMasterExtended.Tests/bin/x64/Release/IdleMasterExtended.Tests.exe --render to create invisible-window PNGs under artifacts/. This mode never shows the app or initializes its Steam browser session. It simulates 100%, 125%, 150%, and 200% scaling in both themes, checks control bounds and long status text, and renders the Settings Save action. These renders are not evidence of actual monitor DPI behavior.
+
+## Optional remembered-session check
+
+The test console accepts --live-session to verify the existing application-owned Steam browser profile and scan badges using authenticated read requests. This is opt-in and is never run by CI. It does not start idle helpers, sign out, or clear the saved profile. The scan has a ten-minute cancellation deadline for large libraries, with shorter per-request limits. Its report under artifacts/live-session-report.txt contains only read statuses, static application failure messages, and aggregate counts; it excludes authentication values, profile addresses, account identifiers, names, and page bodies.
 
 ## Manual release checks
 

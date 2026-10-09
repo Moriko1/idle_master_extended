@@ -14,11 +14,22 @@ namespace IdleMasterExtended
     public sealed class BadgeScanner
     {
         private const int MaximumBadgePages = 1000;
+        private const int MaximumDetailReads = 4096;
         private readonly ICommunityClient community;
+        private readonly IOwnedGamesReader ownedGames;
+        private readonly int detailBudget;
 
-        public BadgeScanner(ICommunityClient community)
+        public BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames = null)
+            : this(community, ownedGames, MaximumDetailReads)
+        { }
+
+        internal BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames, int detailBudget)
         {
+            if (detailBudget < 1 || detailBudget > MaximumDetailReads)
+                throw new ArgumentOutOfRangeException(nameof(detailBudget));
             this.community = community ?? throw new ArgumentNullException(nameof(community));
+            this.ownedGames = ownedGames;
+            this.detailBudget = detailBudget;
         }
 
         public async Task<SteamReadResult<List<Badge>>> ScanAsync(string profileUrl, CancellationToken cancellationToken)
@@ -30,6 +41,8 @@ namespace IdleMasterExtended
 
             var snapshot = new Dictionary<int, Badge>();
             var pageCount = 1;
+            var detailReads = 0;
+            HashSet<int> ownedApps = null;
             for (var pageNumber = 1; pageNumber <= pageCount; pageNumber++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -84,7 +97,38 @@ namespace IdleMasterExtended
                     int cards;
                     double hours;
                     if (!TryStats(row, out cards, out hours))
-                        return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam's card counts could not be read. Your previous game list has been kept.");
+                    {
+                        // Steam can leave this section blank in the badge index even when the
+                        // individual card page contains an explicit remaining-drop status.
+                        // A missing section or an unfamiliar nonempty status is still invalid.
+                        if (!HasEmptyDropsSection(row))
+                            return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam's card counts could not be read. Your previous game list has been kept.");
+                        // Once this scan has a complete verified ownership set, absent apps
+                        // cannot be idled by this account. Skip only genuinely empty index rows.
+                        if (ownedApps != null && !ownedApps.Contains(appId))
+                            continue;
+                        if (++detailReads > detailBudget)
+                            return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned too many badges with missing card counts. Your previous game list has been kept.");
+                        var detail = await ReadCardPageAsync(new Badge { AppId = appId, Name = name }, profile, cancellationToken).ConfigureAwait(false);
+                        if (detail.Result.IsSuccess)
+                        {
+                            snapshot[appId] = detail.Result.Value;
+                            continue;
+                        }
+                        if (detail.Result.Status != SteamReadStatus.MalformedPage || !detail.EmptyDrops || ownedGames == null)
+                            return SteamReadResult<List<Badge>>.Failed(detail.Result.Status, detail.Result.Message);
+                        if (ownedApps == null)
+                        {
+                            var ownership = await ownedGames.ReadAsync(profile, cancellationToken).ConfigureAwait(false);
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (!ownership.IsSuccess)
+                                return SteamReadResult<List<Badge>>.Failed(ownership.Status, ownership.Message);
+                            ownedApps = ownership.Value;
+                        }
+                        if (!ownedApps.Contains(appId))
+                            continue;
+                        return SteamReadResult<List<Badge>>.Failed(detail.Result.Status, detail.Result.Message);
+                    }
                     snapshot[appId] = new Badge { AppId = appId, Name = name, RemainingCard = cards, HoursPlayed = hours };
                 }
             }
@@ -99,23 +143,45 @@ namespace IdleMasterExtended
             string profile;
             if (badge == null || badge.AppId <= 0 || !TryProfileUrl(profileUrl, out profile))
                 return SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage, "The Steam game or profile address is invalid.");
+            return (await ReadCardPageAsync(badge, profile, cancellationToken).ConfigureAwait(false)).Result;
+        }
+
+        private async Task<CardPageRead> ReadCardPageAsync(Badge badge, string profile, CancellationToken cancellationToken)
+        {
             var read = await community.GetAsync(profile + "/gamecards/" + badge.StringId + "/?l=english", cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (!read.IsSuccess)
-                return SteamReadResult<Badge>.Failed(read.Status, read.Message);
+                return new CardPageRead(SteamReadResult<Badge>.Failed(read.Status, read.Message), false);
             var document = ReadDocument(read.Value);
             var problem = PageProblem(document, read.Value);
             if (problem != null)
-                return SteamReadResult<Badge>.Failed(problem.Status, problem.Message);
+                return new CardPageRead(SteamReadResult<Badge>.Failed(problem.Status, problem.Message), false);
             int cards;
             double hours;
             if (!TryStats(document.DocumentNode, out cards, out hours))
-                return SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage, "Steam's card counts could not be read. The previous count has been kept.");
-            return SteamReadResult<Badge>.Succeeded(new Badge
+            {
+                var empty = document.DocumentNode.SelectSingleNode("//*[" + ClassToken("badge_gamecard_page") + "]") != null
+                    && document.DocumentNode.SelectSingleNode("//*[" + ClassToken("badge_title_stats_playtime") + "]") != null
+                    && HasEmptyDropsSection(document.DocumentNode);
+                return new CardPageRead(SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage,
+                    "Steam's card counts could not be read. The previous count has been kept."), empty);
+            }
+            return new CardPageRead(SteamReadResult<Badge>.Succeeded(new Badge
             {
                 AppId = badge.AppId, Name = badge.Name, AveragePrice = badge.AveragePrice,
                 RemainingCard = cards, HoursPlayed = hours
-            });
+            }), false);
+        }
+
+        private sealed class CardPageRead
+        {
+            public SteamReadResult<Badge> Result { get; }
+            public bool EmptyDrops { get; }
+            public CardPageRead(SteamReadResult<Badge> result, bool emptyDrops)
+            {
+                Result = result;
+                EmptyDrops = emptyDrops;
+            }
         }
 
         private static HtmlDocument ReadDocument(string html)
@@ -167,19 +233,20 @@ namespace IdleMasterExtended
             cards = 0;
             hours = 0;
             var drops = scope.SelectSingleNode(".//*[" + ClassToken("badge_title_stats_drops") + "]");
-            var cardNode = (drops ?? scope).SelectSingleNode(".//*[" + ClassToken("progress_info_bold") + "]");
+            if (drops == null) return false;
+            var cardNode = drops.SelectSingleNode(".//*[" + ClassToken("progress_info_bold") + "]");
             if (cardNode != null)
             {
-                var count = Regex.Match(CleanText(cardNode.InnerText), @"[0-9]+");
+                var count = Regex.Match(CleanText(cardNode.InnerText), @"\b([0-9]+)\s+(?:card\s+)?drops?\s+remaining\b", RegexOptions.IgnoreCase);
                 if (count.Success)
                 {
-                    if (!int.TryParse(count.Value, NumberStyles.None, CultureInfo.InvariantCulture, out cards))
+                    if (!int.TryParse(count.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out cards))
                         return false;
                 }
                 else if (!ExplicitNoDrops(CleanText(cardNode.InnerText)))
                     return false;
             }
-            else if (!ExplicitNoDrops(CleanText((drops ?? scope).InnerText)))
+            else
                 return false;
 
             var hoursNode = scope.SelectSingleNode(".//*[" + ClassToken("badge_title_stats_playtime") + "]");
@@ -190,6 +257,13 @@ namespace IdleMasterExtended
             if (!hoursMatch.Success)
                 return hoursText.IndexOf("no playtime", StringComparison.OrdinalIgnoreCase) >= 0;
             return Badge.TryParseHours(hoursMatch.Value, out hours);
+        }
+
+        private static bool HasEmptyDropsSection(HtmlNode row)
+        {
+            var drops = row.SelectSingleNode(".//*[" + ClassToken("badge_title_stats_drops") + "]");
+            return drops != null && !drops.ChildNodes.Any(node => node.NodeType == HtmlNodeType.Element
+                || (node.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(CleanText(node.InnerText))));
         }
 
         private static bool ExplicitNoDrops(string text)

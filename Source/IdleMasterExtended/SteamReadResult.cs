@@ -40,6 +40,11 @@ namespace IdleMasterExtended
         }
     }
 
+    public interface IBoundedCommunityClient : ICommunityClient
+    {
+        Task<SteamReadResult<string>> GetAsync(string url, int maximumResponseBytes, CancellationToken cancellationToken);
+    }
+
     public interface ICommunityClient
     {
         Task<SteamReadResult<string>> GetAsync(string url, CancellationToken cancellationToken);

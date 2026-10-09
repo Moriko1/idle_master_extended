@@ -10,6 +10,8 @@ namespace IdleMasterExtended.Tests
         {
             try
             {
+                if (Array.IndexOf(args, "--live-session") >= 0)
+                    return SessionLiveProbe.Run();
                 if (Array.IndexOf(args, "--render") >= 0)
                 {
                     DesktopRenderTests.Run();

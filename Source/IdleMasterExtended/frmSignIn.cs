@@ -10,7 +10,7 @@ namespace IdleMasterExtended
     {
         private readonly SteamSessionService session;
         private readonly Control home;
-        private readonly Label status = new Label { Dock = DockStyle.Top, Height = 38, Text = UiText.Get("steam_sign_in_help"), Padding = new Padding(8) };
+        private readonly Label status = new Label { Dock = DockStyle.Top, Height = 56, Text = UiText.Get("steam_sign_in_help"), Padding = new Padding(8) };
         private readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer { Interval = 3000 };
         private readonly CancellationTokenSource lifetime = new CancellationTokenSource();
         private bool checking;
@@ -54,7 +54,8 @@ namespace IdleMasterExtended
                 var result = await session.ValidateAsync(lifetime.Token);
                 if (lifetime.IsCancellationRequested) return;
                 if (result.IsSuccess) { SignedIn = result.Value; DialogResult = DialogResult.OK; Close(); }
-                else if (result.Status == SteamReadStatus.TransientFailure) status.Text = UiText.Get("sign_in_network");
+                else if (result.Status == SteamReadStatus.TransientFailure || result.Status == SteamReadStatus.MalformedPage) status.Text = result.Message;
+                else status.Text = UiText.Get("steam_sign_in_help");
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { Logger.Exception(ex, "Sign-in window"); if (!IsDisposed) status.Text = UiText.Get("sign_in_network"); }

@@ -202,7 +202,7 @@ namespace IdleMasterExtended
                             list.Add(new Badge { AppId = id, Name = "App ID: " + id, RemainingCard = -1, HoursPlayed = 0 });
                     read = SteamReadResult<List<Badge>>.Succeeded(list);
                 }
-                else read = await new BadgeScanner(session.Client).ScanAsync(login.Value.ProfileUrl, token);
+                else read = await new BadgeScanner(session.Client, new OwnedGamesReader(session.Client)).ScanAsync(login.Value.ProfileUrl, token);
                 token.ThrowIfCancellationRequested();
                 if (!read.IsSuccess) { lastFailure = read.Status; if (read.Status == SteamReadStatus.LoginRequired) authenticated = false; return read; }
                 AllBadges = read.Value; snapshotSteamId = login.Value.SteamId;
@@ -406,7 +406,7 @@ namespace IdleMasterExtended
             settingsToolStripMenuItem.Enabled = !busy; whitelistToolStripMenuItem.Enabled = blacklistToolStripMenuItem.Enabled = !busy;
             lnkSignIn.Visible = !authenticated; lnkResetCookies.Visible = authenticated;
             lnkSignIn.Enabled = !busy && !Running; lnkResetCookies.Enabled = switchAccount.Enabled = !busy;
-            switchAccount.Visible = authenticated;
+            switchAccount.Visible = authenticated || lastFailure == SteamReadStatus.MalformedPage;
             lblCookieStatus.Text = lastFailure == SteamReadStatus.TransientFailure || lastFailure == SteamReadStatus.MalformedPage ? UiText.Get("account_unavailable") : authenticated ? UiText.Get("account_connected") : UiText.Get("sign_in_required");
             picCookieStatus.Image = StatusImage(authenticated);
             lblSignedOnAs.Visible = authenticated && Settings.Default.showUsername;

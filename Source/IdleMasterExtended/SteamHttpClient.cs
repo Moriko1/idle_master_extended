@@ -1,5 +1,7 @@
 using System;
 using System.Net;
+using System.IO;
+using System.Text;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,8 +9,10 @@ using System.Threading.Tasks;
 namespace IdleMasterExtended
 {
     /// <summary>Bounded Steam Community reads. Failures never delete saved cookies.</summary>
-    public sealed class SteamHttpClient : ICommunityClient, IDisposable
+    public sealed class SteamHttpClient : IBoundedCommunityClient, IDisposable
     {
+        public const int DefaultResponseLimit = 8 * 1024 * 1024;
+        public const int MaximumResponseLimit = 32 * 1024 * 1024;
         private readonly HttpClient client;
         private readonly TimeSpan timeout;
         private readonly int maxRetries;
@@ -34,13 +38,20 @@ namespace IdleMasterExtended
             this.maxRetries = maxRetries;
             client = new HttpClient(handler ?? throw new ArgumentNullException(nameof(handler)), true);
             client.Timeout = Timeout.InfiniteTimeSpan;
-            client.MaxResponseContentBufferSize = 8 * 1024 * 1024;
+            client.MaxResponseContentBufferSize = DefaultResponseLimit;
             client.DefaultRequestHeaders.UserAgent.ParseAdd("IdleMasterExtended/1.12");
             client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.8");
         }
 
-        public async Task<SteamReadResult<string>> GetAsync(string url, CancellationToken cancellationToken)
+        public Task<SteamReadResult<string>> GetAsync(string url, CancellationToken cancellationToken)
         {
+            return GetAsync(url, DefaultResponseLimit, cancellationToken);
+        }
+
+        public async Task<SteamReadResult<string>> GetAsync(string url, int maximumResponseBytes, CancellationToken cancellationToken)
+        {
+            if (maximumResponseBytes < 1 || maximumResponseBytes > MaximumResponseLimit)
+                throw new ArgumentOutOfRangeException(nameof(maximumResponseBytes));
             cancellationToken.ThrowIfCancellationRequested();
             Uri uri;
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || !IsCommunityUri(uri))
@@ -55,7 +66,7 @@ namespace IdleMasterExtended
                     attemptCancellation.CancelAfter(timeout);
                     try
                     {
-                        result = await ReadAsync(uri, attemptCancellation.Token).ConfigureAwait(false);
+                        result = await ReadAsync(uri, maximumResponseBytes, attemptCancellation.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -66,6 +77,10 @@ namespace IdleMasterExtended
                     {
                         result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam could not be reached. Check your connection and try again.");
                     }
+                    catch (IOException)
+                    {
+                        result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam's response was interrupted. Try again shortly.");
+                    }
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 if (result.Status != SteamReadStatus.TransientFailure || attempt == maxRetries)
@@ -75,13 +90,14 @@ namespace IdleMasterExtended
             return result;
         }
 
-        private async Task<SteamReadResult<string>> ReadAsync(Uri uri, CancellationToken cancellationToken)
+        private async Task<SteamReadResult<string>> ReadAsync(Uri uri, int maximumResponseBytes, CancellationToken cancellationToken)
         {
             var current = uri;
             for (var redirects = 0; redirects <= 5; redirects++)
             {
                 using (var request = new HttpRequestMessage(HttpMethod.Get, current))
-                using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false))
+                using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
+                using (var cancelResponse = cancellationToken.Register(() => response.Dispose()))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var status = (int)response.StatusCode;
@@ -108,14 +124,64 @@ namespace IdleMasterExtended
                     if (!response.IsSuccessStatusCode)
                         return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam could not provide the requested page.");
 
-                    var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (string.IsNullOrWhiteSpace(content))
-                        return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam returned an empty response. Try again shortly.");
-                    return SteamReadResult<string>.Succeeded(content);
+                    return await ReadContentAsync(response.Content, maximumResponseBytes, cancellationToken).ConfigureAwait(false);
                 }
             }
             return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam redirected too many times.");
+        }
+
+        internal static async Task<SteamReadResult<string>> ReadContentAsync(HttpContent content, int maximumResponseBytes, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (content == null)
+                return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam returned an empty response. Try again shortly.");
+            if (content.Headers.ContentLength > maximumResponseBytes)
+                return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam's response was too large to read safely. Your previous game list has been kept.");
+            try
+            {
+                using (var source = await content.ReadAsStreamAsync().ConfigureAwait(false))
+                using (var cancelRead = cancellationToken.Register(() => source.Dispose()))
+                using (var buffer = new MemoryStream())
+                {
+                    var chunk = new byte[16 * 1024];
+                    while (true)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var read = await source.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false);
+                        if (read == 0) break;
+                        if (buffer.Length + read > maximumResponseBytes)
+                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam's response was too large to read safely. Your previous game list has been kept.");
+                        buffer.Write(chunk, 0, read);
+                    }
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var encoding = Encoding.UTF8;
+                    var charset = content.Headers.ContentType?.CharSet;
+                    if (!string.IsNullOrWhiteSpace(charset))
+                    {
+                        try { encoding = Encoding.GetEncoding(charset.Trim('"')); }
+                        catch (ArgumentException)
+                        {
+                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam returned an unsupported text format.");
+                        }
+                    }
+                    buffer.Position = 0;
+                    string text;
+                    using (var reader = new StreamReader(buffer, encoding, true))
+                        text = reader.ReadToEnd();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return string.IsNullOrWhiteSpace(text)
+                        ? SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam returned an empty response. Try again shortly.")
+                        : SteamReadResult<string>.Succeeded(text);
+                }
+            }
+            catch (IOException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+            catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
         }
 
         private static bool IsCommunityUri(Uri uri)
