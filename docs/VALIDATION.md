@@ -12,7 +12,7 @@ Blank badge-index counts now use an explicit count from the individual card page
 
 - Both executables build as x64 Release for .NET Framework 4.8, with no compiler warnings or errors.
 - Four regression suites pass: Community reads and badge parsing; run supervision and cancellation; Settings Save/Cancel; session identity verification.
-- Synthetic HTTP cases include authenticated empty accounts, expired login, timeouts, HTTP 429, malformed pages, pagination, decimal formats and retention of the previous snapshot.
+- Synthetic HTTP cases include authenticated empty accounts, expired login, timeouts, HTTP 429, malformed pages, pagination, decimal formats and retention of the previous snapshot. New cases cover verified ownership, shared-license counts, rejected redirects, cancellation of streams that ignore tokens, explicit count phrases, and legitimate scans requiring more than 128 detail reads.
 - Controller cases cover cancellation during launches and fast-mode delays, 30-helper limits, initialization failure, unexpected exit, account mismatch, skipped games on resume, failed scans and completion cleanup.
 - A real Windows Job Object test confirms that disposing the owned job stops its child and leaves an unrelated process running.
 - Main-window rendering and control geometry pass at synthetic 100%, 125%, 150% and 200% scales, in light and dark themes. Settings controls and long failure messages render visibly. These are rendered forms, not actual monitor DPI changes.
@@ -23,6 +23,7 @@ Blank badge-index counts now use an explicit count from the individual card page
 
 - After the user signed in through the application, the corrected cookie bridge verified the remembered Community account using its authenticated viewer identity. No authentication values or account identifiers were written to the report.
 - A fresh opt-in probe verified the remembered account after the previous application and all browser processes for its profile had exited. Opening the probe started no idle helpers.
+- A complete authenticated badge scan then succeeded through the production scanner and ownership reader. The atomic snapshot reported eligible games and remaining cards; no helpers were launched.
 - Real idling and card drops have not yet been verified.
 
 ## Pending user-operated checks
