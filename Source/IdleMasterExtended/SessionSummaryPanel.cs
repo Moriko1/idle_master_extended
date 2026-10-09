@@ -44,6 +44,8 @@ namespace IdleMasterExtended
             var duration = ((int)elapsed.TotalHours).ToString("00") + elapsed.ToString(@"\:mm\:ss");
             details.Text = string.Format(UiText.Get("session_details"), duration, summary.CardsObserved,
                 summary.RemainingCards?.ToString() ?? UiText.Get("unknown"), summary.GamesCompleted, summary.RemainingGames);
+            if (summary.PrivateGamesSkipped > 0)
+                details.Text += Environment.NewLine + string.Format(UiText.Get("private_games_skipped"), summary.PrivateGamesSkipped);
             shutdown.Visible = offerShutdown;
             Visible = true; BringToFront();
         }

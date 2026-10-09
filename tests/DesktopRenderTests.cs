@@ -52,6 +52,7 @@ namespace IdleMasterExtended.Tests
                         Invoke(form, "LocalizeMenus");
                         Invoke(form, "ApplyTheme");
                         Invoke(form, "CheckSteam");
+                        form.AllBadges.Add(new Badge { AppId = 20, Name = "Synthetic private game", RemainingCard = -1, IsPrivate = true });
                         form.UpdateStateInfo();
                         Invoke(form, "UpdateCountdown");
                         // Create and render an invisible window. Show and message pumping are never used.
@@ -83,7 +84,7 @@ namespace IdleMasterExtended.Tests
                             issues.Add(suffix + ": long failure status requires " + measured.Height +
                                 "px, available " + status.ClientSize.Height + "px.");
                         var tracker = new IdleSessionTracker();
-                        tracker.Start(new[] { new IdleGame(10, "Game", 4, 1) }, IdleMode.Single);
+                        tracker.Start(new[] { new IdleGame(10, "Game", 4, 1) }, IdleMode.Single, new[] { 20, 30, 40 });
                         tracker.Observe(new[] { new IdleGame(10, "Game", 2, 2) });
                         var summary = Field<SessionSummaryPanel>(form, "summaryPanel");
                         summary.Present(tracker.Finish(false, TimeSpan.FromMinutes(17)));

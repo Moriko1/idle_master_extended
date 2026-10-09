@@ -18,6 +18,7 @@ namespace IdleMasterExtended.Tests
                     return 0;
                 }
                 Test.RunAsync("Community reads and badge parsing", CommunityReadTests.RunAllAsync);
+                Test.RunAsync("Private game verification and atomic queue filtering", async () => { await PrivateGamesTests.RunAllAsync(); await PrivateQueueTests.RunAllAsync(); });
                 Test.RunAsync("Idle run supervision and cancellation", IdleRunTests.RunAllAsync);
                 Test.Run("Settings save and cancellation", SettingsTests.RunAll);
                 Test.Run("Steam session identity", SessionTests.RunAll);
@@ -25,7 +26,7 @@ namespace IdleMasterExtended.Tests
                 Test.Run("Helper Steam connection resilience", HelperConnectionTests.RunAll);
                 Test.Run("Portable preference persistence", SettingsPersistenceTests.RunAll);
                 Test.Run("Empty-queue Start availability", StartAvailabilityTests.RunAll);
-                Console.WriteLine("PASS: all 8 regression suites.");
+                Console.WriteLine("PASS: all 9 regression suites.");
                 return 0;
             }
             catch (Exception exception)

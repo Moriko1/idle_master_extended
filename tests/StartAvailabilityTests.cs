@@ -35,6 +35,12 @@ namespace IdleMasterExtended.Tests
                     fixture.AssertEnabled(true, "A verified card-dropping game enables Start.");
                     fixture.Games();
                     fixture.AssertEnabled(false, "A successfully scanned empty account cannot start.");
+                    fixture.Games(new Badge { AppId = 10, Name = "Private game", RemainingCard = 3, HoursPlayed = 2, IsPrivate = true });
+                    fixture.AssertEnabled(false, "An account with only private card games cannot start.");
+                    fixture.Games(new Badge { AppId = 10, Name = "Private library game", RemainingCard = 3, HoursPlayed = 2 });
+                    fixture.Set("privateAppIds", new HashSet<int> { 10 });
+                    fixture.AssertEnabled(false, "The verified private list excludes games even without a badge flag.");
+                    fixture.Set("privateAppIds", new HashSet<int>());
                     fixture.Games(new Badge { AppId = 10, Name = "Completed game", RemainingCard = 0, HoursPlayed = 2 });
                     fixture.AssertEnabled(false, "A completed card queue cannot start.");
                     fixture.Games(new Badge { AppId = 10, Name = "Unknown card count", RemainingCard = -1, HoursPlayed = 2 });
@@ -54,6 +60,8 @@ namespace IdleMasterExtended.Tests
                     Settings.Default.whitelist = Collection("20");
                     fixture.Games(new Badge { AppId = 20, Name = "Whitelisted game", RemainingCard = -1, HoursPlayed = 0 });
                     fixture.AssertEnabled(true, "A nonempty explicit whitelist can idle without card counts or prior playtime.");
+                    fixture.Games(new Badge { AppId = 20, Name = "Private whitelisted game", RemainingCard = -1, IsPrivate = true });
+                    fixture.AssertEnabled(false, "Whitelist mode cannot override account privacy exclusions.");
                     fixture.Games();
                     fixture.AssertEnabled(false, "An empty scanned whitelist cannot start.");
                     Settings.Default.blacklist = Collection("20");

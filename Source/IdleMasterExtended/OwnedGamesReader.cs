@@ -18,12 +18,19 @@ namespace IdleMasterExtended
         Task<SteamReadResult<HashSet<int>>> ReadAsync(string profileUrl, CancellationToken cancellationToken);
     }
 
-    /// <summary>Reads complete ownership with the current browser session; never persists its API token.</summary>
-    public sealed class OwnedGamesReader : IOwnedGamesReader
+    public interface IPrivateGamesReader
+    {
+        Task<SteamReadResult<HashSet<int>>> ReadPrivateAsync(string profileUrl, CancellationToken cancellationToken);
+    }
+
+    /// <summary>Reads ownership and private apps with the browser session; never persists its API token.</summary>
+    public sealed class OwnedGamesReader : IOwnedGamesReader, IPrivateGamesReader
     {
         private const string ApiEndpoint = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
+        private const string PrivateApiEndpoint = "https://api.steampowered.com/IAccountPrivateAppsService/GetPrivateAppList/v1/";
         private const int MaximumGames = 100000;
         private const string InvalidLibrary = "Steam's owned game list could not be verified. Your previous game list has been kept.";
+        private const string InvalidPrivateList = "Steam's private game list could not be verified. Your previous game list has been kept.";
         private readonly ICommunityClient community;
         private readonly Func<HttpMessageHandler> transportFactory;
 
@@ -38,16 +45,23 @@ namespace IdleMasterExtended
             });
         }
 
-        public async Task<SteamReadResult<HashSet<int>>> ReadAsync(string profileUrl, CancellationToken cancellationToken)
+        public Task<SteamReadResult<HashSet<int>>> ReadAsync(string profileUrl, CancellationToken cancellationToken) =>
+            ReadCoreAsync(profileUrl, false, cancellationToken);
+
+        public Task<SteamReadResult<HashSet<int>>> ReadPrivateAsync(string profileUrl, CancellationToken cancellationToken) =>
+            ReadCoreAsync(profileUrl, true, cancellationToken);
+
+        private async Task<SteamReadResult<HashSet<int>>> ReadCoreAsync(string profileUrl, bool privateGames, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var listName = privateGames ? "private game list" : "owned game list";
             Uri profile;
             if (!Uri.TryCreate(profileUrl, UriKind.Absolute, out profile) || profile.Scheme != Uri.UriSchemeHttps
                 || !profile.IsDefaultPort || !string.IsNullOrEmpty(profile.UserInfo)
                 || !string.Equals(profile.Host, "steamcommunity.com", StringComparison.OrdinalIgnoreCase))
-                return Failed();
+                return Failed(privateGames);
             var account = Regex.Match(profile.AbsolutePath, @"^/profiles/([0-9]{17})/?$");
-            if (!account.Success || account.Groups[1].Value.All(ch => ch == '0')) return Failed();
+            if (!account.Success || account.Groups[1].Value.All(ch => ch == '0')) return Failed(privateGames);
             var steamId = account.Groups[1].Value;
             var url = profile.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/games/?tab=all&l=english";
             var bounded = community as IBoundedCommunityClient;
@@ -60,19 +74,21 @@ namespace IdleMasterExtended
             var proof = TrySessionProof(page.Value, steamId, out token);
             if (proof != SteamReadStatus.Success)
                 return SteamReadResult<HashSet<int>>.Failed(proof,
-                    proof == SteamReadStatus.LoginRequired ? "Sign in to the same Steam account again to continue." : InvalidLibrary);
+                    proof == SteamReadStatus.LoginRequired ? "Sign in to the same Steam account again to continue." : privateGames ? InvalidPrivateList : InvalidLibrary);
 
             // Current official Community transport/token contract:
             // https://cdn.fastly.steamstatic.com/steamcommunity/public/ssr/CFcRBfQR.js
             // https://cdn.fastly.steamstatic.com/steamcommunity/public/ssr/BKJ3hLh4.js
             // Explicit inclusion avoids the profile page's default omission of free subscriptions.
-            var input = new Dictionary<string, object>
+            // Official games route privacy contract: empty request; the verified token identifies its account.
+            // https://cdn.fastly.steamstatic.com/steamcommunity/public/ssr/MZknbyKp.js
+            var input = privateGames ? new Dictionary<string, object>() : new Dictionary<string, object>
             {
                 { "steamid", steamId }, { "include_appinfo", true },
                 { "include_played_free_games", true }, { "include_free_sub", true },
                 { "skip_unvetted_apps", false }, { "include_family_licenses", true }
             };
-            var requestUrl = ApiEndpoint + "?access_token=" + Uri.EscapeDataString(token)
+            var requestUrl = (privateGames ? PrivateApiEndpoint : ApiEndpoint) + "?access_token=" + Uri.EscapeDataString(token)
                 + "&input_json=" + Uri.EscapeDataString(Serializer().Serialize(input)) + "&format=json";
             // The origin is fixed; redirects are rejected before another request can forward the token.
             using (var client = new HttpClient(transportFactory(), true))
@@ -97,19 +113,19 @@ namespace IdleMasterExtended
                                 if (status == 401)
                                     result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
                                 else if (status == 429 || status == 408 || status >= 500)
-                                    result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's owned game list is temporarily unavailable. Try again shortly.");
+                                    result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " is temporarily unavailable. Try again shortly.");
                                 else if (!response.IsSuccessStatusCode)
-                                    result = Failed();
+                                    result = Failed(privateGames);
                                 else
                                 {
                                     IEnumerable<string> results;
                                     if (!response.Headers.TryGetValues("x-eresult", out results)
                                         || results.Count() != 1 || results.Single().Trim() != "1")
-                                        result = Failed();
+                                        result = Failed(privateGames);
                                     else
                                     {
                                         var content = await SteamHttpClient.ReadContentAsync(response.Content, SteamHttpClient.DefaultResponseLimit, deadline.Token).ConfigureAwait(false);
-                                        result = content.IsSuccess ? ParseGames(content.Value)
+                                        result = content.IsSuccess ? (privateGames ? ParsePrivateGames(content.Value) : ParseGames(content.Value))
                                             : SteamReadResult<HashSet<int>>.Failed(content.Status, content.Message);
                                     }
                                 }
@@ -118,15 +134,15 @@ namespace IdleMasterExtended
                         catch (OperationCanceledException)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's owned game list took too long to respond. Try again shortly.");
+                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " took too long to respond. Try again shortly.");
                         }
                         catch (HttpRequestException)
                         {
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's owned game list could not be reached. Try again shortly.");
+                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " could not be reached. Try again shortly.");
                         }
                         catch (IOException)
                         {
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's owned game list was interrupted. Try again shortly.");
+                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " was interrupted. Try again shortly.");
                         }
                     }
                     cancellationToken.ThrowIfCancellationRequested();
@@ -219,6 +235,36 @@ namespace IdleMasterExtended
             catch (InvalidOperationException) { return Failed(); }
         }
 
+        private static SteamReadResult<HashSet<int>> ParsePrivateGames(string json)
+        {
+            try
+            {
+                var root = Object(Serializer().DeserializeObject(json));
+                object value;
+                var response = root != null && root.TryGetValue("response", out value) ? Object(value) : null;
+                var privateApps = response != null && response.TryGetValue("private_apps", out value) ? Object(value) : null;
+                if (privateApps == null) return Failed(true);
+                // A present protobuf message can omit its empty repeated field. A missing
+                // response/message is not evidence that the account has no private games.
+                if (!privateApps.TryGetValue("appids", out value))
+                    return SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int>());
+                var appIds = value as object[];
+                if (appIds == null || appIds.Length > MaximumGames) return Failed(true);
+                var apps = new HashSet<int>();
+                foreach (var item in appIds)
+                {
+                    int appId;
+                    if (item is int) appId = (int)item;
+                    else if (item is long && (long)item > 0 && (long)item <= int.MaxValue) appId = (int)(long)item;
+                    else return Failed(true);
+                    if (appId <= 0 || !apps.Add(appId)) return Failed(true);
+                }
+                return SteamReadResult<HashSet<int>>.Succeeded(apps);
+            }
+            catch (ArgumentException) { return Failed(true); }
+            catch (InvalidOperationException) { return Failed(true); }
+        }
+
         private static SteamReadStatus AccountStatus(Dictionary<string, object> data, string expected)
         {
             object value;
@@ -247,6 +293,7 @@ namespace IdleMasterExtended
             MaxJsonLength = SteamHttpClient.MaximumResponseLimit, RecursionLimit = 100
         };
 
-        private static SteamReadResult<HashSet<int>> Failed() => SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.MalformedPage, InvalidLibrary);
+        private static SteamReadResult<HashSet<int>> Failed(bool privateGames = false) =>
+            SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.MalformedPage, privateGames ? InvalidPrivateList : InvalidLibrary);
     }
 }

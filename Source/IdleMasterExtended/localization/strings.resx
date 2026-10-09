@@ -310,4 +310,7 @@ Games remaining at last check: {4}</value></data>
   <data name="settings_next_session" xml:space="preserve"><value>Settings saved. Idling continues; mode and filter changes apply to the next session.</value></data>
   <data name="pause" xml:space="preserve"><value>Pause</value></data>
   <data name="session_queue_finished" xml:space="preserve"><value>Idling queue finished</value></data>
+  <data name="private_games_skipped" xml:space="preserve"><value>Private games skipped: {0}</value></data>
+  <data name="private_skipped_short" xml:space="preserve"><value>{0} private skipped</value></data>
+  <data name="private_skipped" xml:space="preserve"><value>private, skipped</value></data>
 </root>

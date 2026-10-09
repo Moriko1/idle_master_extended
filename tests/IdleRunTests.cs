@@ -16,6 +16,11 @@ namespace IdleMasterExtended.Tests
         {
             await PrioritizesReadyThenManyAsync();
             await CapsWhitelistWithoutCardCompletionAsync();
+            await WhitelistRefreshRemovesExcludedGamesAsync();
+            await PrivateExclusionsSurviveFailedScansAsync();
+            await AllPrivateFailedScanWaitsForSuccessAsync();
+            await PrivatePendingLaunchIsCanceledAsync();
+            await ConcurrentStopAndPrivacyUpdateStayStoppedAsync();
             await PauseCancelsFastTransitionsAsync();
             await SkipSurvivesRefreshAsync();
             await ResumeRescanPreservesSkippedAsync();
@@ -65,23 +70,228 @@ namespace IdleMasterExtended.Tests
             var factory = new FakeFactory();
             var clock = new FakeClock();
             var scans = 0;
+            var whitelist = Enumerable.Range(1, 31).Select(id => Game(id, -1)).ToArray();
             using (var run = new IdleRunController(factory, token =>
             {
                 Interlocked.Increment(ref scans);
-                return Task.FromResult<IReadOnlyList<IdleGame>>(new IdleGame[0]);
+                return Task.FromResult<IReadOnlyList<IdleGame>>(whitelist);
             }, clock))
             {
-                await run.StartAsync(Enumerable.Range(1, 31).Select(id => Game(id, -1)), SteamId, IdleMode.Whitelist);
+                await run.StartAsync(whitelist, SteamId, IdleMode.Whitelist);
                 await Until(() => clock.PendingCount == 1, "whitelist batch");
                 Assert(factory.ActiveCount == 30 && factory.MaximumActive == 30, "The helper limit is thirty, not thirty-one.");
                 Assert(run.Snapshot.RemainingGames.Count == 31, "Games beyond the concurrency limit remain queued.");
                 clock.ReleaseNext();
-                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 30, "next whitelist phase");
+                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 30 && scans == 1, "next whitelist phase");
                 Assert(factory.StartCount == 30, "An unchanged whitelist keeps its existing helpers.");
-                Assert(scans == 0 && run.Snapshot.State == IdleRunState.Running,
+                Assert(scans == 1 && run.Snapshot.State == IdleRunState.Running,
                     "Whitelist idling does not auto-complete from card counts.");
                 await run.StopAsync();
                 Assert(factory.ActiveCount == 0, "All whitelist helpers stop.");
+            }
+        }
+
+        private static async Task WhitelistRefreshRemovesExcludedGamesAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var initial = new[] { Game(1, -1), Game(2, -1) };
+            var scans = 0;
+            using (var run = new IdleRunController(factory, token =>
+            {
+                token.ThrowIfCancellationRequested();
+                var scan = Interlocked.Increment(ref scans);
+                return Task.FromResult<IReadOnlyList<IdleGame>>(scan == 1
+                    ? new[] { Game(2, -1) } : new IdleGame[0]);
+            }, clock))
+            {
+                await run.StartAsync(initial, SteamId, IdleMode.Whitelist);
+                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 2, "initial privacy-checked whitelist");
+                Assert(clock.NextDelay == TimeSpan.FromMinutes(6), "Whitelist privacy checks use the normal six-minute interval.");
+                clock.ReleaseNext();
+                await Until(() => clock.PendingCount == 1 && scans == 1 && factory.ActiveCount == 1,
+                    "private game removed from active whitelist");
+                Assert(!factory.IsActive(1) && factory.IsActive(2),
+                    "Removing a newly private game must dispose only its helper.");
+                Assert(factory.StartCount == 2 && run.Snapshot.State == IdleRunState.Running
+                    && run.Snapshot.ActiveGames.Single().AppId == 2 && run.Snapshot.RemainingGames.Single().AppId == 2,
+                    "A remaining whitelist helper must continue without relaunching or card completion.");
+                clock.ReleaseNext();
+                await Until(() => run.Snapshot.State == IdleRunState.Completed && scans == 2,
+                    "entire whitelist excluded by verified private-game policy");
+                Assert(factory.ActiveCount == 0 && clock.PendingCount == 0 && factory.StartCount == 2,
+                    "An all-excluded whitelist must complete and release every helper and delay.");
+            }
+        }
+
+        private static async Task PrivateExclusionsSurviveFailedScansAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var initial = new[] { Game(1, 3), Game(2, 3) };
+            var firstScan = new TaskCompletionSource<IReadOnlyList<IdleGame>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var scans = 0;
+            using (var run = new IdleRunController(factory, token =>
+            {
+                var scan = Interlocked.Increment(ref scans);
+                return scan == 1 ? firstScan.Task : Task.FromResult<IReadOnlyList<IdleGame>>(initial);
+            }, clock))
+            {
+                await run.StartAsync(initial, SteamId, IdleMode.ManyThenOne);
+                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 2, "private exclusion initial batch");
+                clock.ReleaseNext();
+                await Until(() => scans == 1, "delayed card scan after privacy request");
+                var privateIds = new HashSet<int> { 1 };
+                run.UpdatePrivateGames(privateIds);
+                privateIds.Clear();
+                await Until(() => factory.ActiveCount == 1 && !factory.IsActive(1), "newly private helper released during scan");
+                Assert(factory.IsActive(2) && run.Snapshot.State == IdleRunState.Running && !firstScan.Task.IsCompleted,
+                    "Independent privacy proof must stop only its helper while other games continue during a delayed card scan.");
+                firstScan.TrySetException(new IdleRefreshException(SteamReadStatus.TransientFailure, "Card page timeout after verified privacy"));
+                await Until(() => clock.PendingCount == 1 && run.Snapshot.ReadFailure == SteamReadStatus.TransientFailure,
+                    "typed retry after private helper removal");
+                Assert(run.Snapshot.State == IdleRunState.Running && factory.IsActive(2) && factory.StartCount == 2
+                    && run.Snapshot.RemainingGames.Single().AppId == 2 && run.Snapshot.RemainingGames.Single().RemainingCards == 3,
+                    "A failed card page must preserve remaining counts and keep the unaffected helper idling.");
+                clock.ReleaseNext();
+                await Until(() => scans == 2 && clock.PendingCount == 1 && run.Snapshot.ReadFailure == null,
+                    "successful scan following private exclusion");
+                Assert(!factory.IsActive(1) && factory.IsActive(2) && factory.StartCount == 2
+                    && run.Snapshot.RemainingGames.Single().AppId == 2,
+                    "The copied private policy must survive retries and exclude stale returned games without relaunching peers.");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task AllPrivateFailedScanWaitsForSuccessAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var initial = new[] { Game(1, 3, 2) };
+            var firstScan = new TaskCompletionSource<IReadOnlyList<IdleGame>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var scans = 0;
+            using (var run = new IdleRunController(factory, token =>
+            {
+                var scan = Interlocked.Increment(ref scans);
+                return scan == 1 ? firstScan.Task : Task.FromResult<IReadOnlyList<IdleGame>>(initial);
+            }, clock))
+            {
+                await run.StartAsync(initial, SteamId, IdleMode.Single);
+                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 1, "all-private initial helper");
+                clock.ReleaseNext();
+                await Until(() => scans == 1, "all-private pending card scan");
+                run.UpdatePrivateGames(new[] { 1 });
+                Assert(factory.ActiveCount == 0 && run.Snapshot.State == IdleRunState.Running,
+                    "A verified private game must stop immediately without prematurely declaring card completion.");
+                firstScan.TrySetException(new IdleRefreshException(SteamReadStatus.MalformedPage, "Card page failed after all-private proof"));
+                await Until(() => clock.PendingCount == 1 && run.Snapshot.ReadFailure == SteamReadStatus.MalformedPage,
+                    "all-private failed scan retry");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Count == 0
+                    && factory.ActiveCount == 0 && initial[0].RemainingCards == 3,
+                    "All-private exclusions plus an incomplete card scan must retain the session and honest card counts.");
+                clock.ReleaseNext();
+                await Until(() => scans == 2 && run.Snapshot.State == IdleRunState.Completed,
+                    "all-private successful full refresh");
+                Assert(factory.ActiveCount == 0 && factory.StartCount == 1 && clock.PendingCount == 0,
+                    "Only a successful full refresh may complete the all-private run, without restarting excluded helpers.");
+            }
+        }
+
+        private static async Task PrivatePendingLaunchIsCanceledAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            var late = new TaskCompletionSource<IIdleHelper>(TaskCreationOptions.RunContinuationsAsynchronously);
+            CancellationToken pendingToken = default(CancellationToken);
+            var released = 0;
+            var retained = new FakeHelper(2, SteamId, null);
+            factory.StartOverride = (appId, steamId, token) =>
+            {
+                if (appId == 1) { pendingToken = token; return late.Task; }
+                return Task.FromResult<IIdleHelper>(retained);
+            };
+            var initial = new[] { Game(1), Game(2) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(initial), clock))
+            {
+                await run.StartAsync(initial, SteamId, IdleMode.ManyThenOne);
+                await Until(() => factory.Attempts == 1, "pending helper before private proof");
+                run.UpdatePrivateGames(new[] { 1 });
+                await Until(() => factory.Attempts == 2 && clock.PendingCount == 1, "retained game after private pending launch");
+                Assert(pendingToken.IsCancellationRequested && retained.IsRunning
+                    && run.Snapshot.ActiveGames.Single().AppId == 2,
+                    "A verified private pending launch must cancel without blocking or stopping other queued games.");
+                late.TrySetResult(new FakeHelper(1, SteamId, () => Interlocked.Increment(ref released)));
+                await Until(() => released == 1, "late private helper cleanup");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Single().AppId == 2,
+                    "A late private helper must never become active or rejoin the queue.");
+                await run.StopAsync();
+                Assert(!retained.IsRunning, "Manual Stop must still release the retained helper.");
+            }
+        }
+
+        private static async Task ConcurrentStopAndPrivacyUpdateStayStoppedAsync()
+        {
+            // Exercise both lock acquisition orders without real helpers or timers.
+            for (var iteration = 0; iteration < 32; iteration++)
+            {
+                var factory = new FakeFactory();
+                var clock = new FakeClock();
+                var games = new[] { Game(1, 3, 2) };
+                using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+                using (var startTogether = new Barrier(2))
+                {
+                    await run.StartAsync(games, SteamId, IdleMode.Single);
+                    await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 1, "concurrent privacy and Stop setup");
+                    var stop = Task.Run(async () =>
+                    {
+                        startTogether.SignalAndWait();
+                        await run.StopAsync();
+                    });
+                    var privacy = Task.Run(() =>
+                    {
+                        startTogether.SignalAndWait();
+                        run.UpdatePrivateGames(new[] { 1 });
+                    });
+                    await Task.WhenAll(stop, privacy);
+                    Assert(run.Snapshot.State == IdleRunState.Stopped && factory.ActiveCount == 0 && clock.PendingCount == 0,
+                        "Concurrent verified privacy updates must never overwrite manual Stop with a stale running state.");
+                }
+            }
+
+            // A disposal callback may finish after Stop publishes its terminal state.
+            // Its obsolete privacy event must not resurrect the stopped UI either.
+            var blockedClock = new FakeClock();
+            var blockingFactory = new FakeFactory();
+            var disposeStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (var releaseDispose = new ManualResetEventSlim())
+            {
+                var helper = new FakeHelper(1, SteamId, () =>
+                {
+                    disposeStarted.TrySetResult(true);
+                    releaseDispose.Wait(TimeSpan.FromSeconds(3));
+                });
+                blockingFactory.StartOverride = (appId, steamId, token) => Task.FromResult<IIdleHelper>(helper);
+                var games = new[] { Game(1, 3, 2) };
+                using (var run = new IdleRunController(blockingFactory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), blockedClock))
+                {
+                    var stoppedSeen = false;
+                    var staleAfterStop = false;
+                    run.StatusChanged += (sender, status) =>
+                    {
+                        if (status.State == IdleRunState.Stopped) stoppedSeen = true;
+                        else if (stoppedSeen) staleAfterStop = true;
+                    };
+                    await run.StartAsync(games, SteamId, IdleMode.Single);
+                    await Until(() => blockedClock.PendingCount == 1, "blocked privacy disposal setup");
+                    var privacy = Task.Run(() => run.UpdatePrivateGames(new[] { 1 }));
+                    await Until(() => disposeStarted.Task.IsCompleted, "private helper disposal blocked");
+                    try { await run.StopAsync(); }
+                    finally { releaseDispose.Set(); }
+                    await privacy;
+                    Assert(run.Snapshot.State == IdleRunState.Stopped && !helper.IsRunning && blockedClock.PendingCount == 0
+                        && stoppedSeen && !staleAfterStop,
+                        "Late private cleanup must not publish a stale running event after manual Stop.");
+                }
             }
         }
 
@@ -590,6 +800,11 @@ namespace IdleMasterExtended.Tests
                     MaximumActive = Math.Max(MaximumActive, helpers.Count(item => item.IsRunning));
                     return Task.FromResult<IIdleHelper>(helper);
                 }
+            }
+
+            public bool IsActive(int appId)
+            {
+                lock (sync) return helpers.Any(helper => helper.AppId == appId && helper.IsRunning);
             }
 
             public void Fail(int appId)

@@ -18,18 +18,20 @@ namespace IdleMasterExtended
         private readonly ICommunityClient community;
         private readonly IOwnedGamesReader ownedGames;
         private readonly int detailBudget;
+        private readonly HashSet<int> privateApps;
 
-        public BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames = null)
-            : this(community, ownedGames, MaximumDetailReads)
+        public BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames = null, IEnumerable<int> privateApps = null)
+            : this(community, ownedGames, MaximumDetailReads, privateApps)
         { }
 
-        internal BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames, int detailBudget)
+        internal BadgeScanner(ICommunityClient community, IOwnedGamesReader ownedGames, int detailBudget, IEnumerable<int> privateApps = null)
         {
             if (detailBudget < 1 || detailBudget > MaximumDetailReads)
                 throw new ArgumentOutOfRangeException(nameof(detailBudget));
             this.community = community ?? throw new ArgumentNullException(nameof(community));
             this.ownedGames = ownedGames;
             this.detailBudget = detailBudget;
+            this.privateApps = new HashSet<int>(privateApps ?? Enumerable.Empty<int>());
         }
 
         public async Task<SteamReadResult<List<Badge>>> ScanAsync(string profileUrl, CancellationToken cancellationToken)
@@ -87,10 +89,20 @@ namespace IdleMasterExtended
                         return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned an invalid game ID.");
 
                     var title = row.SelectSingleNode(".//*[" + ClassToken("badge_title") + "]");
-                    if (title == null)
+                    if (title == null && !privateApps.Contains(appId))
                         return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned a badge without a game name.");
-                    var directTitle = string.Join(" ", title.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text).Select(n => n.InnerText));
-                    var name = CleanText(string.IsNullOrWhiteSpace(directTitle) ? title.InnerText : directTitle);
+                    var directTitle = title == null ? "" : string.Join(" ", title.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text).Select(n => n.InnerText));
+                    var name = title == null ? "" : CleanText(string.IsNullOrWhiteSpace(directTitle) ? title.InnerText : directTitle);
+                    if (privateApps.Contains(appId))
+                    {
+                        // Steam can omit counts for private games. Keep the exclusion visible,
+                        // without inventing zero drops or requesting an ineligible card page.
+                        int privateCards; double privateHours;
+                        var known = TryStats(row, out privateCards, out privateHours);
+                        snapshot[appId] = new Badge { AppId = appId, Name = string.IsNullOrWhiteSpace(name) ? "App ID: " + appId : name,
+                            IsPrivate = true, RemainingCard = known ? privateCards : -1, HoursPlayed = known ? privateHours : 0 };
+                        continue;
+                    }
                     if (string.IsNullOrWhiteSpace(name))
                         return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned a badge without a game name.");
 

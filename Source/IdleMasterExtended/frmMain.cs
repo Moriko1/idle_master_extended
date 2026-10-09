@@ -43,6 +43,7 @@ namespace IdleMasterExtended
         private Statistics statistics = new Statistics();
         private bool authenticated, ready, busy, closing, closeAllowed;
         private ulong runSteamId, snapshotSteamId;
+        private HashSet<int> privateAppIds = new HashSet<int>();
         private SteamReadStatus? lastFailure;
         private CancellationTokenSource scanCancellation;
         private CancellationTokenSource artworkCancellation;
@@ -194,7 +195,7 @@ namespace IdleMasterExtended
             var blacklist = sessionTracker.Active ? runBlacklist : new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
             return AllBadges.Where(b => mode == IdleMode.Whitelist ||
                 (b.RemainingCard > 0 && (!onlyPlayed || b.HoursPlayed > 0)))
-                .Where(b => !blacklist.Contains(b.StringId))
+                .Where(b => !b.IsPrivate && !privateAppIds.Contains(b.AppId) && !blacklist.Contains(b.StringId))
                 .Select(b => new IdleGame(b.AppId, b.Name, b.RemainingCard, b.HoursPlayed)).ToList();
         }
         private async Task<SteamReadResult<List<Badge>>> ScanAsync(CancellationToken token, bool forRun)
@@ -214,35 +215,52 @@ namespace IdleMasterExtended
                     authenticated = false; lastFailure = SteamReadStatus.LoginRequired;
                     return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.LoginRequired, UiText.Get("account_changed"));
                 }
-                SteamReadResult<List<Badge>> read;
-                if ((forRun ? runMode : SelectedMode) == IdleMode.Whitelist)
-                {
-                    var list = new List<Badge>();
-                    foreach (string value in forRun ? runWhitelist : (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>())
-                        if (int.TryParse(value, out var id) && id > 0 && !list.Any(b => b.AppId == id))
-                            list.Add(new Badge { AppId = id, Name = "App ID: " + id, RemainingCard = -1, HoursPlayed = 0 });
-                    read = SteamReadResult<List<Badge>>.Succeeded(list);
-                }
-                else read = await new BadgeScanner(session.Client, new OwnedGamesReader(session.Client)).ScanAsync(login.Value.ProfileUrl, token);
+                var library = new OwnedGamesReader(session.Client);
+                var whitelist = (forRun ? runMode : SelectedMode) == IdleMode.Whitelist
+                    ? (forRun ? runWhitelist : (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>())
+                    : null;
+                var read = await new GameQueueScanner(session.Client, library, library)
+                    .ReadAsync(login.Value.ProfileUrl, whitelist, token, ids => OnUiAsync(() =>
+                    {
+                        token.ThrowIfCancellationRequested();
+                        ApplyVerifiedPrivacy(ids, login.Value.SteamId);
+                        return Task.FromResult(true);
+                    }));
                 token.ThrowIfCancellationRequested();
-                if (!read.IsSuccess) { lastFailure = read.Status; if (read.Status == SteamReadStatus.LoginRequired) authenticated = false; return read; }
-                AllBadges = read.Value; snapshotSteamId = login.Value.SteamId;
+                if (!read.IsSuccess)
+                {
+                    lastFailure = read.Status;
+                    if (read.Status == SteamReadStatus.LoginRequired) authenticated = false;
+                    return SteamReadResult<List<Badge>>.Failed(read.Status, read.Message);
+                }
+                AllBadges = read.Value.Badges; privateAppIds = read.Value.PrivateAppIds; snapshotSteamId = login.Value.SteamId;
                 var sort = forRun ? runSort : Settings.Default.sort;
                 if (sort == "mostcards") AllBadges = AllBadges.OrderByDescending(b => b.RemainingCard).ToList();
                 else if (sort == "leastcards") AllBadges = AllBadges.OrderBy(b => b.RemainingCard).ToList();
                 lastFailure = null; ready = true;
-                if (forRun && runMode != IdleMode.Whitelist)
+                if (forRun)
                 {
                     var previous = sessionTracker.CardsObserved;
-                    sessionTracker.Observe(AllBadges.Select(b => new IdleGame(b.AppId, b.Name, b.RemainingCard, b.HoursPlayed)));
+                    sessionTracker.Observe(AllBadges.Select(b => new IdleGame(b.AppId, b.Name, b.RemainingCard, b.HoursPlayed)), privateAppIds);
                     var observed = sessionTracker.CardsObserved - previous;
                     if (observed > 0) statistics.increaseCardIdled((uint)Math.Min(uint.MaxValue, observed));
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
                 UpdateStateInfo();
-                return read;
+                return SteamReadResult<List<Badge>>.Succeeded(AllBadges);
             }
             finally { scanGate.Release(); }
+        }
+        private void ApplyVerifiedPrivacy(HashSet<int> appIds, ulong steamId)
+        {
+            if (closing || IsDisposed || (snapshotSteamId != 0 && snapshotSteamId != steamId)) return;
+            // Positive privacy evidence is independent of card counts. Stop these helpers
+            // even if a later badge page fails, while retaining the previous card snapshot.
+            privateAppIds = new HashSet<int>(appIds);
+            foreach (var badge in AllBadges) badge.IsPrivate = privateAppIds.Contains(badge.AppId);
+            sessionTracker.ExcludePrivateGames(privateAppIds);
+            controller?.UpdatePrivateGames(privateAppIds);
+            UpdateStateInfo();
         }
         private async Task<IReadOnlyList<IdleGame>> RefreshForRunAsync(CancellationToken token)
         {
@@ -299,12 +317,6 @@ namespace IdleMasterExtended
                 if (!validation.IsSuccess) { if (validation.Status == SteamReadStatus.LoginRequired) authenticated = false; lastFailure = validation.Status; ready = false; SetMessage(validation.Message); return; }
                 if ((runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted) && runSteamId != validation.Value.SteamId)
                 { ready = false; SetMessage(UiText.Get("account_changed")); return; }
-                if (snapshotSteamId != validation.Value.SteamId)
-                {
-                    ready = false;
-                    var replacement = await ScanAsync(lifetime.Token, false);
-                    if (!replacement.IsSuccess) { SetMessage(replacement.Message); return; }
-                }
                 if (runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted)
                 {
                     if (runSteamId != validation.Value.SteamId) { ready = false; SetMessage(UiText.Get("account_changed")); return; }
@@ -314,11 +326,18 @@ namespace IdleMasterExtended
                 }
                 else
                 {
+                    // Recheck private flags and cards before a new run, as well as on Resume.
+                    SetMessage(UiText.Get("scanning"));
+                    var read = await ScanAsync(lifetime.Token, false);
+                    if (!read.IsSuccess) { ready = false; SetMessage(read.Message); return; }
+                    if (GamesForRun().Count == 0) { SetMessage(UiText.Get("no_cards")); return; }
                     statistics = new Statistics(); elapsed.Reset();
                     deferredRunSettings = false; runMode = SelectedMode; runOnlyPlayed = Settings.Default.IdleOnlyPlayed; runSort = Settings.Default.sort;
                     runBlacklist = new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
                     runWhitelist = (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>().ToList();
-                    sessionTracker.Start(GamesForRun(), runMode); summaryPanel.Dismiss();
+                    sessionTracker.Start(GamesForRun(), runMode, AllBadges.Where(b => b.IsPrivate && !runBlacklist.Contains(b.StringId) &&
+                        (runMode == IdleMode.Whitelist || (b.RemainingCard != 0 && (!runOnlyPlayed || b.HoursPlayed > 0))))
+                        .Select(b => b.AppId)); summaryPanel.Dismiss();
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
                 runSteamId = snapshotSteamId;
@@ -332,6 +351,8 @@ namespace IdleMasterExtended
         {
             if (closing || IsDisposed) return;
             if (InvokeRequired) { try { BeginInvoke(new Action(() => ControllerChanged(sender, status))); } catch (InvalidOperationException) { } return; }
+            // Queued UI notifications may arrive after a newer Stop or privacy update.
+            if (controller != null && !ReferenceEquals(controller.Snapshot, status)) return;
             runStatus = status;
             var active = new HashSet<int>(status.ActiveGames.Select(g => g.AppId));
             foreach (var badge in AllBadges) { var id = badge.AppId; badge.SetIdleStatusProvider(() => active.Contains(id)); }
@@ -401,7 +422,7 @@ namespace IdleMasterExtended
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
                 await session.SignOutAsync();
                 if (closing) return;
-                AllBadges.Clear(); CurrentBadge = null; authenticated = false; runSteamId = snapshotSteamId = 0; lastFailure = null;
+                AllBadges.Clear(); privateAppIds.Clear(); CurrentBadge = null; authenticated = false; runSteamId = snapshotSteamId = 0; lastFailure = null;
                 UpdateStateInfo();
             }
             catch (Exception ex) { Logger.Exception(ex, "Switch account"); SetMessage(UiText.Get("sign_in_network")); }
@@ -437,7 +458,7 @@ namespace IdleMasterExtended
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
                 await session.SignOutAsync();
                 if (closing) return;
-                AllBadges.Clear(); CurrentBadge = null; authenticated = false; snapshotSteamId = runSteamId = 0; lastFailure = null;
+                AllBadges.Clear(); privateAppIds.Clear(); CurrentBadge = null; authenticated = false; snapshotSteamId = runSteamId = 0; lastFailure = null;
                 SetMessage(UiText.Get("signed_out")); UpdateStateInfo();
             }
             catch (Exception ex) { Logger.Exception(ex, "Sign out"); SetMessage(UiText.Get("sign_in_network")); }
@@ -468,10 +489,12 @@ namespace IdleMasterExtended
             var games = GamesForRun();
             lblDrops.Text = snapshotSteamId == 0 ? UiText.Get("cards_not_scanned") : EffectiveMode == IdleMode.Whitelist ? UiText.Get("whitelist_mode") : string.Format(UiText.Get("cards_remaining"), Math.Max(0, games.Sum(g => g.RemainingCards)));
             lblIdle.Text = string.Format(UiText.Get("games_available"), games.Count, runStatus?.ActiveGames.Count ?? 0);
+            var privateCount = AllBadges.Count(b => b.IsPrivate);
+            if (privateCount > 0) lblIdle.Text += " | " + string.Format(UiText.Get("private_skipped_short"), privateCount);
             GamesState.BeginUpdate(); GamesState.Items.Clear();
-            foreach (var badge in AllBadges.Where(b => EffectiveMode == IdleMode.Whitelist || b.RemainingCard > 0))
+            foreach (var badge in AllBadges.Where(b => b.IsPrivate || EffectiveMode == IdleMode.Whitelist || b.RemainingCard > 0))
             {
-                var row = new ListViewItem((badge.InIdle ? "> " : "") + badge.Name);
+                var row = new ListViewItem((badge.InIdle ? "> " : "") + badge.Name + (badge.IsPrivate ? " (" + UiText.Get("private_skipped") + ")" : ""));
                 row.SubItems.Add(badge.HoursPlayed.ToString("0.##")); GamesState.Items.Add(row);
             }
             GamesState.EndUpdate();

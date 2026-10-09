@@ -76,6 +76,10 @@ namespace IdleMasterExtended
         private readonly object sync = new object();
         private readonly List<IIdleHelper> helpers = new List<IIdleHelper>();
         private readonly HashSet<int> skipped = new HashSet<int>();
+        private HashSet<int> privateGames = new HashSet<int>();
+        private readonly Dictionary<int, CancellationTokenSource> pendingLaunches =
+            new Dictionary<int, CancellationTokenSource>();
+        private bool privateRefreshPending;
         private List<IdleGame> games = new List<IdleGame>();
         private List<IdleGame> active = new List<IdleGame>();
         private CancellationTokenSource runCancellation;
@@ -118,10 +122,48 @@ namespace IdleMasterExtended
                     expectedSteamId = steamId;
                     if (!keepSkipped) skipped.Clear();
                     games = FilterGames(supplied);
+                    privateRefreshPending = false;
                 }
                 BeginRun();
             }
             finally { commands.Release(); }
+        }
+
+        /// <summary>Applies independently verified privacy exclusions without treating them as card completion.</summary>
+        public void UpdatePrivateGames(IEnumerable<int> appIds)
+        {
+            if (appIds == null) throw new ArgumentNullException(nameof(appIds));
+            var verified = new HashSet<int>(appIds);
+            if (verified.Any(appId => appId <= 0)) throw new ArgumentOutOfRangeException(nameof(appIds));
+            List<IIdleHelper> removed;
+            List<CancellationTokenSource> launches;
+            IdleRunStatus updated;
+            lock (sync)
+            {
+                if (disposed) return;
+                privateGames = verified;
+                var excluded = games.RemoveAll(game => privateGames.Contains(game.AppId));
+                active.RemoveAll(game => privateGames.Contains(game.AppId));
+                removed = helpers.Where(helper => privateGames.Contains(helper.AppId)).ToList();
+                foreach (var helper in removed) helpers.Remove(helper);
+                launches = pendingLaunches.Where(item => privateGames.Contains(item.Key)).Select(item => item.Value).ToList();
+                if (excluded > 0 && (snapshot.State == IdleRunState.Starting || snapshot.State == IdleRunState.Running))
+                    privateRefreshPending = true;
+                updated = new IdleRunStatus(snapshot.State, mode, active, games,
+                    snapshot.NextCheckAt, snapshot.Error, snapshot.ReadFailure);
+                snapshot = updated;
+            }
+            foreach (var launch in launches)
+            {
+                try { launch.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }
+            foreach (var helper in removed)
+            {
+                try { helper.Dispose(); }
+                catch { /* One helper cannot prevent other private exclusions. */ }
+            }
+            NotifyChanged(updated);
         }
 
         public async Task PauseAsync()
@@ -189,7 +231,7 @@ namespace IdleMasterExtended
             ThrowIfDisposed();
             lock (sync)
             {
-                if (games.Count == 0) { Publish(IdleRunState.Completed); return; }
+                if (games.Count == 0 && !privateRefreshPending) { Publish(IdleRunState.Completed); return; }
                 runCancellation = new CancellationTokenSource();
                 var token = runCancellation.Token;
                 Publish(IdleRunState.Starting);
@@ -221,7 +263,14 @@ namespace IdleMasterExtended
                     token.ThrowIfCancellationRequested();
                     List<IdleGame> remaining;
                     lock (sync) remaining = games.ToList();
-                    if (remaining.Count == 0) { finished = true; break; }
+                    if (remaining.Count == 0)
+                    {
+                        bool needsRefresh;
+                        lock (sync) needsRefresh = privateRefreshPending;
+                        if (needsRefresh) { await RefreshAsync(token).ConfigureAwait(false); continue; }
+                        finished = true;
+                        break;
+                    }
 
                     if (mode == IdleMode.Fast && remaining.Count > 1)
                     {
@@ -250,7 +299,9 @@ namespace IdleMasterExtended
                             ? TimeSpan.FromMinutes(6)
                             : TimeSpan.FromMinutes(selected[0].RemainingCards == 1 ? 5 : 15);
                         await WaitAsync(duration, token).ConfigureAwait(false);
-                        if (mode != IdleMode.Whitelist) await RefreshAsync(token).ConfigureAwait(false);
+                        // Whitelists have no card-completion test, but still need periodic
+                        // account and per-game privacy validation before retaining helpers.
+                        await RefreshAsync(token).ConfigureAwait(false);
                     }
                 }
             }
@@ -284,11 +335,12 @@ namespace IdleMasterExtended
 
         private async Task StartHelpersAsync(IEnumerable<IdleGame> selectedGames, CancellationToken token)
         {
-            var selected = selectedGames.Take(MaximumHelpers).ToList();
-            var wanted = new HashSet<int>(selected.Select(game => game.AppId));
+            List<IdleGame> selected;
             List<IIdleHelper> obsolete;
             lock (sync)
             {
+                selected = selectedGames.Where(game => !privateGames.Contains(game.AppId)).Take(MaximumHelpers).ToList();
+                var wanted = new HashSet<int>(selected.Select(game => game.AppId));
                 obsolete = helpers.Where(helper => !wanted.Contains(helper.AppId)).ToList();
                 foreach (var helper in obsolete) helpers.Remove(helper);
                 active = selected.Where(game => helpers.Any(helper => helper.AppId == game.AppId)).ToList();
@@ -299,34 +351,52 @@ namespace IdleMasterExtended
             {
                 token.ThrowIfCancellationRequested();
                 await EnsureHelpersAliveAsync().ConfigureAwait(false);
-                lock (sync) if (helpers.Any(existing => existing.AppId == game.AppId)) continue;
-                var startup = factory.StartAsync(game.AppId, expectedSteamId, token);
-                IIdleHelper helper;
-                try { helper = await AwaitCancelableAsync(startup, token).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                CancellationTokenSource launch;
+                lock (sync)
                 {
-                    ObserveAndDisposeLateHelper(startup);
-                    throw;
+                    if (privateGames.Contains(game.AppId) || helpers.Any(existing => existing.AppId == game.AppId)) continue;
+                    launch = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    pendingLaunches[game.AppId] = launch;
                 }
-                if (helper == null) throw new IdleHelperException("The idling helper did not initialize.");
-                var accepted = false;
+                Task<IIdleHelper> startup = null;
+                var returned = false;
                 try
                 {
-                    token.ThrowIfCancellationRequested();
-                    if (helper.AppId != game.AppId || helper.SteamId != expectedSteamId)
-                        throw new IdleHelperException("The idling helper is using a different Steam account or game.");
-                    lock (sync)
+                    startup = factory.StartAsync(game.AppId, expectedSteamId, launch.Token);
+                    var helper = await AwaitCancelableAsync(startup, launch.Token).ConfigureAwait(false);
+                    returned = true;
+                    if (helper == null) throw new IdleHelperException("The idling helper did not initialize.");
+                    var accepted = false;
+                    try
                     {
                         token.ThrowIfCancellationRequested();
-                        if (disposed) throw new OperationCanceledException(token);
-                        Observe(helper.Completion);
-                        helpers.Add(helper);
-                        active.Add(game);
-                        accepted = true;
+                        lock (sync)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            if (disposed) throw new OperationCanceledException(token);
+                            if (privateGames.Contains(game.AppId)) continue;
+                            if (helper.AppId != game.AppId || helper.SteamId != expectedSteamId)
+                                throw new IdleHelperException("The idling helper is using a different Steam account or game.");
+                            Observe(helper.Completion);
+                            helpers.Add(helper);
+                            active.Add(game);
+                            accepted = true;
+                        }
                     }
+                    finally { if (!accepted) helper.Dispose(); }
+                    await EnsureHelpersAliveAsync().ConfigureAwait(false);
                 }
-                finally { if (!accepted) helper.Dispose(); }
-                await EnsureHelpersAliveAsync().ConfigureAwait(false);
+                catch (OperationCanceledException) when (launch.IsCancellationRequested)
+                {
+                    if (!returned && startup != null) ObserveAndDisposeLateHelper(startup);
+                    token.ThrowIfCancellationRequested();
+                    lock (sync) if (!privateGames.Contains(game.AppId)) throw;
+                }
+                finally
+                {
+                    lock (sync) pendingLaunches.Remove(game.AppId);
+                    launch.Dispose();
+                }
             }
             Publish(IdleRunState.Running);
         }
@@ -363,16 +433,8 @@ namespace IdleMasterExtended
                 Observe(refresh);
                 try
                 {
-                    List<Task> waiting;
-                    lock (sync) waiting = helpers.Select(helper => helper.Completion).ToList();
-                    waiting.Add(refresh);
-                    var completed = await AwaitCancelableAsync(Task.WhenAny(waiting), token).ConfigureAwait(false);
-                    token.ThrowIfCancellationRequested();
-                    if (completed != refresh)
-                    {
-                        await completed.ConfigureAwait(false);
-                        throw new IdleHelperException("An idling helper stopped during the badge check. Check Steam and try again.");
-                    }
+                    await WaitForPhaseAsync(refresh, token,
+                        "An idling helper stopped during the badge check. Check Steam and try again.").ConfigureAwait(false);
                     var refreshed = await AwaitCancelableAsync(refresh, token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
                     if (refreshed == null || refreshed.Any(game => game == null))
@@ -382,6 +444,7 @@ namespace IdleMasterExtended
                     {
                         token.ThrowIfCancellationRequested();
                         games = FilterGames(refreshed);
+                        privateRefreshPending = false;
                     }
                 }
                 finally { phase.Cancel(); }
@@ -390,7 +453,7 @@ namespace IdleMasterExtended
 
         private List<IdleGame> FilterGames(IEnumerable<IdleGame> supplied)
         {
-            return supplied.Where(game => !skipped.Contains(game.AppId) &&
+            return supplied.Where(game => !skipped.Contains(game.AppId) && !privateGames.Contains(game.AppId) &&
                     (mode == IdleMode.Whitelist || game.RemainingCards > 0))
                 .GroupBy(game => game.AppId).Select(group => group.First()).ToList();
         }
@@ -405,17 +468,36 @@ namespace IdleMasterExtended
                 var delay = clock.DelayAsync(duration, phase.Token);
                 try
                 {
-                    List<Task> waiting;
-                    lock (sync) waiting = helpers.Select(helper => helper.Completion).ToList();
-                    waiting.Add(delay);
-                    var completed = await AwaitCancelableAsync(Task.WhenAny(waiting), token).ConfigureAwait(false);
-                    token.ThrowIfCancellationRequested();
-                    await completed.ConfigureAwait(false);
-                    if (completed != delay)
-                        throw new IdleHelperException("An idling helper stopped unexpectedly. Check Steam and sign in again.");
+                    await WaitForPhaseAsync(delay, token,
+                        "An idling helper stopped unexpectedly. Check Steam and sign in again.").ConfigureAwait(false);
+                    await delay.ConfigureAwait(false);
                 }
                 finally { phase.Cancel(); }
             }
+        }
+
+        private async Task WaitForPhaseAsync(Task phase, CancellationToken token, string failure)
+        {
+            while (true)
+            {
+                List<Task> waiting;
+                lock (sync) waiting = helpers.Select(helper => helper.Completion).ToList();
+                waiting.Add(phase);
+                var completed = await AwaitCancelableAsync(Task.WhenAny(waiting), token).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                if (completed == phase) return;
+                // A verified private exclusion deliberately removes and disposes only
+                // its helper. Rebuild watchers rather than mistaking cleanup for a crash.
+                if (!IsRegisteredCompletion(completed)) continue;
+                try { await completed.ConfigureAwait(false); }
+                catch { if (!IsRegisteredCompletion(completed)) continue; throw; }
+                if (IsRegisteredCompletion(completed)) throw new IdleHelperException(failure);
+            }
+        }
+
+        private bool IsRegisteredCompletion(Task completion)
+        {
+            lock (sync) return helpers.Any(helper => helper.Completion == completion);
         }
 
         private async Task EnsureHelpersAliveAsync()
@@ -424,10 +506,16 @@ namespace IdleMasterExtended
             lock (sync) current = helpers.ToList();
             foreach (var helper in current)
             {
+                if (!IsRegisteredCompletion(helper.Completion)) continue;
                 if (!helper.IsRunning || helper.Completion.IsCompleted)
                 {
-                    if (helper.Completion.IsCompleted) await helper.Completion.ConfigureAwait(false);
-                    throw new IdleHelperException("An idling helper stopped unexpectedly. Check Steam and sign in again.");
+                    try
+                    {
+                        if (helper.Completion.IsCompleted) await helper.Completion.ConfigureAwait(false);
+                    }
+                    catch { if (!IsRegisteredCompletion(helper.Completion)) continue; throw; }
+                    if (IsRegisteredCompletion(helper.Completion))
+                        throw new IdleHelperException("An idling helper stopped unexpectedly. Check Steam and sign in again.");
                 }
             }
         }
@@ -452,12 +540,22 @@ namespace IdleMasterExtended
             SteamReadStatus? readFailure = null)
         {
             IdleRunStatus status;
-            lock (sync) status = new IdleRunStatus(state, mode, active, games, nextCheck, error, readFailure);
-            snapshot = status;
+            lock (sync)
+            {
+                status = new IdleRunStatus(state, mode, active, games, nextCheck, error, readFailure);
+                snapshot = status;
+            }
+            NotifyChanged(status);
+        }
+
+        private void NotifyChanged(IdleRunStatus status)
+        {
+            if (!ReferenceEquals(snapshot, status)) return;
             var handlers = StatusChanged;
             if (handlers == null) return;
             foreach (EventHandler<IdleRunStatus> handler in handlers.GetInvocationList())
             {
+                if (!ReferenceEquals(snapshot, status)) return;
                 try { handler(this, status); }
                 catch { /* UI subscribers cannot prevent helper cleanup. */ }
             }

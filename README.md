@@ -29,7 +29,8 @@ Your Community login must match the account in the running Steam client.
 - **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
 - Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
 - Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings.
-- Whitelist mode has no automatic card completion; stop it manually. At most 30 games run together.
+- Whitelist mode has no automatic card completion; stop it manually. Its queue ends if all entries become private. At most 30 games run together.
+- Games marked Private on Steam are skipped in every mode, including Whitelist, because [Steam does not award them card drops](https://help.steampowered.com/en/faqs/view/1150-C06F-4D62-4966). The app verifies the account's private list before Start/Resume and on periodic queue refreshes. A failed check preserves the previous snapshot and retries; it cannot prove completion.
 - Show Steam username defaults to on. Saved preferences survive restarts and portable-folder upgrades.
 - **Start** stays disabled when there are no eligible games.
 - Settings changes apply only on **Save**. **Cancel** discards edits and leaves idling alone. During a session, appearance and sleep settings apply immediately; mode and filter changes apply to the next session.

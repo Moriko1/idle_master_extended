@@ -39,7 +39,7 @@ namespace IdleMasterExtended.Tests
             SteamReadStatus account = SteamReadStatus.TransientFailure;
             SteamReadStatus badges = SteamReadStatus.TransientFailure;
             bool verified = false;
-            int? games = null, eligible = null, cards = null;
+            int? games = null, eligible = null, cards = null, privateGames = null;
             string scanMessage = null;
             int exit = 6;
             using (var host = new Form { ShowInTaskbar = false, Width = 100, Height = 100 })
@@ -68,15 +68,17 @@ namespace IdleMasterExtended.Tests
                         exit = 2;
                         if (verified)
                         {
-                            var scan = await new BadgeScanner(session.Client, new OwnedGamesReader(session.Client))
-                                .ScanAsync(validation.Value.ProfileUrl, cancellation.Token);
+                            var library = new OwnedGamesReader(session.Client);
+                            var scan = await new GameQueueScanner(session.Client, library, library)
+                                .ReadAsync(validation.Value.ProfileUrl, null, cancellation.Token);
                             badges = scan.Status;
                             scanMessage = scan.IsSuccess ? null : scan.Message;
                             if (scan.IsSuccess)
                             {
-                                games = scan.Value.Count;
-                                eligible = scan.Value.Count(badge => badge.RemainingCard > 0);
-                                cards = scan.Value.Sum(badge => Math.Max(0, badge.RemainingCard));
+                                games = scan.Value.Badges.Count;
+                                privateGames = scan.Value.PrivateAppIds.Count;
+                                eligible = scan.Value.Badges.Count(badge => !badge.IsPrivate && badge.RemainingCard > 0);
+                                cards = scan.Value.Badges.Where(badge => !badge.IsPrivate).Sum(badge => Math.Max(0, badge.RemainingCard));
                                 exit = 0;
                             }
                         }
@@ -96,6 +98,7 @@ namespace IdleMasterExtended.Tests
             }
             var report = string.Join(Environment.NewLine, new[] {
                 "Initialization status: " + initialized,
+                "Verified private app count: " + (privateGames?.ToString() ?? "unavailable"),
                 "Account status: " + account,
                 "Verified account: " + verified.ToString().ToLowerInvariant(),
                 "Badge scan status: " + badges,

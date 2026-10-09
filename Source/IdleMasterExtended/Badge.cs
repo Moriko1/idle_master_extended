@@ -15,6 +15,7 @@ namespace IdleMasterExtended
         public string Name { get; set; }
         public int RemainingCard { get; set; }
         public double HoursPlayed { get; set; }
+        public bool IsPrivate { get; set; }
         public string StringId
         {
             get { return AppId.ToString(CultureInfo.InvariantCulture); }
