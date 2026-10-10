@@ -139,6 +139,13 @@ namespace IdleMasterExtended
             return SteamReadResult<SteamSession>.Succeeded(new SteamSession(id,
                 string.IsNullOrWhiteSpace(name) ? id.ToString() : WebUtility.HtmlDecode(name).Trim()));
         }
+        public void ReleasePage()
+        {
+            // Keep the dedicated profile cookies, but release Steam page scripts/rendering after sign-in.
+            try { if (IsInitialized && !Browser.Visible) Browser.CoreWebView2.Navigate("about:blank"); }
+            catch (InvalidOperationException) { }
+            catch (System.Runtime.InteropServices.COMException) { }
+        }
         public async Task SignOutAsync()
         {
             await gate.WaitAsync();

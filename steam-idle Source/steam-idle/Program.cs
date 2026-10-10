@@ -136,6 +136,8 @@ namespace steam_idle
                 if (!status.Connect(options.StatusPipe)) { Environment.ExitCode = 3; return; }
                 try
                 {
+                    try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal; }
+                    catch { /* A scheduling preference cannot prevent idling. */ }
                     if (options.ParentPid.HasValue)
                     {
                         try
@@ -161,12 +163,9 @@ namespace steam_idle
                         return;
                     }
                     initialized = true;
-                    if (!SteamUser.BLoggedOn())
-                    {
-                        status.Send("ERROR STEAM_OFFLINE");
-                        Environment.ExitCode = 6;
-                        return;
-                    }
+                    // BLoggedOn measures backend connectivity. A brief server
+                    // outage must not invalidate a verified local account.
+                    // https://partner.steamgames.com/doc/api/ISteamUser#BLoggedOn
                     var steamId = SteamUser.GetSteamID().m_SteamID;
                     var contextFailure = HelperConnectionGuard.Check(false, SteamAPI.IsSteamRunning(),
                         options.ExpectedSteamId, steamId, false);

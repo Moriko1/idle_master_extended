@@ -11,7 +11,6 @@ using System.Windows.Forms;
 using IdleMasterExtended.Properties;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
-using Steamworks;
 
 namespace IdleMasterExtended
 {
@@ -20,7 +19,16 @@ namespace IdleMasterExtended
         public List<Badge> AllBadges { get; private set; } = new List<Badge>();
         public Badge CurrentBadge { get; private set; }
         private readonly SteamSessionService session = new SteamSessionService();
-        private readonly Func<bool> steamClientIsRunning;
+        private readonly Func<bool> testSteamClientProbe;
+        private readonly SteamActivityMonitor steamActivity = new SteamActivityMonitor();
+        private readonly SteamClientLossPolicy clientLoss = new SteamClientLossPolicy();
+        private readonly Stopwatch activityClock = Stopwatch.StartNew();
+        private readonly RunNoticePolicy notices = new RunNoticePolicy();
+        private bool steamAvailable, steamAccountChanged, activityReadPending, visualStateDirty;
+        private Task activityRead = Task.CompletedTask;
+        internal Func<bool> VisualWorkProbe { get; set; }
+        private bool VisualWorkAllowed => VisualWorkProbe?.Invoke() ??
+            (Visible && WindowState != FormWindowState.Minimized && ContainsFocus);
         private readonly WebView2 browser = new WebView2 { Size = new Size(1, 1), Visible = false };
         private readonly CancellationTokenSource lifetime = new CancellationTokenSource();
         private readonly SemaphoreSlim scanGate = new SemaphoreSlim(1, 1);
@@ -47,20 +55,25 @@ namespace IdleMasterExtended
         private SteamReadStatus? lastFailure;
         private CancellationTokenSource scanCancellation;
         private CancellationTokenSource artworkCancellation;
-        private int artworkAppId;
+        private int artworkAppId, artworkPendingAppId;
+        private readonly HashSet<int> artworkAttempts = new HashSet<int>();
         private IdleRunStatus runStatus;
         private readonly Image darkTrue = InvertStatusImage(Resources.imgTrue);
         private readonly Image darkFalse = InvertStatusImage(Resources.imgFalse);
-        public frmMain() : this(SteamAPI.IsSteamRunning) { }
+        public frmMain() : this(null) { }
         internal frmMain(Func<bool> steamClientIsRunning)
         {
-            this.steamClientIsRunning = steamClientIsRunning ?? throw new ArgumentNullException(nameof(steamClientIsRunning));
+            testSteamClientProbe = steamClientIsRunning;
+            if (testSteamClientProbe != null) { steamAvailable = testSteamClientProbe(); VisualWorkProbe = () => true; }
             InitializeComponent();
             Controls.Add(browser);
             ConfigureControls();
             SetMessage(UiText.Get("sign_in_required")); UpdateStateInfo();
             displayTimer.Tick += (s, e) => UpdateCountdown();
-            displayTimer.Start();
+            Activated += (s, e) => UpdateVisualWork();
+            Deactivate += (s, e) => UpdateVisualWork();
+            VisibleChanged += (s, e) => UpdateVisualWork();
+            notifyIcon1.BalloonTipClicked += (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
             FormClosing += ClosingAsync;
         }
         private void ConfigureControls()
@@ -119,7 +132,7 @@ namespace IdleMasterExtended
             pbIdle.Size = new Size(160, 16);
             btnPause.Visible = btnSkip.Visible = true;
             foreach (var timer in new[] { tmrReadyToGo, tmrCardDropCheck, tmrStartNext, tmrBadgeReload, tmrCheckCookieData, tmrCheckSteam, tmrStatistics }) timer.Stop();
-            tmrCheckSteam.Interval = 5000; tmrCheckSteam.Start();
+            tmrCheckSteam.Interval = 3000; tmrCheckSteam.Start();
             UpdateButtons();
         }
         private async void frmMain_Load(object sender, EventArgs e)
@@ -136,7 +149,8 @@ namespace IdleMasterExtended
                 helpers = new IdleProcessManager();
                 controller = new IdleRunController(helpers, RefreshForRunAsync);
                 controller.StatusChanged += ControllerChanged;
-                CheckSteam();
+                notifyIcon1.Visible = true;
+                await CheckSteamAsync();
                 try
                 {
                     CoreWebView2Environment.GetAvailableBrowserVersionString();
@@ -308,8 +322,10 @@ namespace IdleMasterExtended
         private async Task StartOrResumeAsync()
         {
             if (busy || Running || controller == null || !session.IsInitialized || closing) return;
-            if (!steamClientIsRunning()) { SetMessage(UiText.Get("steam_required")); return; }
-            if (!ready) { await RefreshManuallyAsync(); if (!ready) return; }
+            await CheckSteamAsync();
+            if (busy || Running || closing) return;
+            if (!steamAvailable || steamAccountChanged) { SetMessage(UiText.Get(steamAccountChanged ? "steam_account_mismatch" : "steam_required")); return; }
+            if (!ready) { await RefreshManuallyAsync(); if (!ready || busy || Running || closing) return; }
             busy = true; UpdateButtons();
             try
             {
@@ -331,7 +347,7 @@ namespace IdleMasterExtended
                     var read = await ScanAsync(lifetime.Token, false);
                     if (!read.IsSuccess) { ready = false; SetMessage(read.Message); return; }
                     if (GamesForRun().Count == 0) { SetMessage(UiText.Get("no_cards")); return; }
-                    statistics = new Statistics(); elapsed.Reset();
+                    statistics = new Statistics(); elapsed.Reset(); artworkAttempts.Clear();
                     deferredRunSettings = false; runMode = SelectedMode; runOnlyPlayed = Settings.Default.IdleOnlyPlayed; runSort = Settings.Default.sort;
                     runBlacklist = new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
                     runWhitelist = (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>().ToList();
@@ -341,6 +357,8 @@ namespace IdleMasterExtended
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
                 runSteamId = snapshotSteamId;
+                await CheckSteamAsync();
+                if (!steamAvailable || steamAccountChanged) { SetMessage(UiText.Get(steamAccountChanged ? "steam_account_mismatch" : "steam_required")); return; }
                 await controller.StartAsync(GamesForRun(), runSteamId, EffectiveMode, runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted);
             }
             catch (OperationCanceledException) { }
@@ -354,15 +372,20 @@ namespace IdleMasterExtended
             // Queued UI notifications may arrive after a newer Stop or privacy update.
             if (controller != null && !ReferenceEquals(controller.Snapshot, status)) return;
             runStatus = status;
+            IdleSessionSummary completedSummary = null;
             var active = new HashSet<int>(status.ActiveGames.Select(g => g.AppId));
             foreach (var badge in AllBadges) { var id = badge.AppId; badge.SetIdleStatusProvider(() => active.Contains(id)); }
             CurrentBadge = status.ActiveGames.Count == 1 ? AllBadges.FirstOrDefault(b => b.AppId == status.ActiveGames[0].AppId) : null;
             if (status.State == IdleRunState.Running)
             {
-                elapsed.Start(); tmrStatistics.Start();
-                if (Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
-                SetMessage(status.ReadFailure.HasValue ? UiText.Get("running_retry") : UiText.Get("running"));
-                if (CurrentBadge != null) _ = LoadArtworkAsync(CurrentBadge.AppId);
+                if (status.ActiveGames.Count > 0) { elapsed.Start(); tmrStatistics.Start(); }
+                else { elapsed.Stop(); tmrStatistics.Stop(); }
+                if (Settings.Default.NoSleep && status.ActiveGames.Count > 0) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
+                else AllowSleep();
+                SetMessage(status.Error ?? (status.GameplayActive
+                    ? UiText.Get(status.ActiveGames.Count > 0 ? "gaming_warmup" : "gaming_waiting")
+                    : status.ReadFailure.HasValue ? UiText.Get("running_retry") : UiText.Get("running")));
+                if (CurrentBadge != null && VisualWorkAllowed) _ = LoadArtworkAsync(CurrentBadge.AppId);
             }
             else
             {
@@ -371,13 +394,24 @@ namespace IdleMasterExtended
                 if (status.State == IdleRunState.Completed)
                 {
                     SetMessage(string.Format(UiText.Get("completion_summary"), statistics.getSessionCardIdled(), elapsed.Elapsed.ToString(@"hh\:mm\:ss")));
-                    PresentSessionSummary(true);
+                    completedSummary = PresentSessionSummary(true);
                 }
-                else if (status.State == IdleRunState.Paused) SetMessage(UiText.Get("paused"));
+                else if (status.State == IdleRunState.Paused) SetMessage(status.Error ?? UiText.Get("paused"));
                 else if (status.State == IdleRunState.Faulted) { ready = false; SetMessage(status.Error ?? UiText.Get("idle_failed")); btnRefresh.Text = UiText.Get("retry"); }
                 else if (status.State == IdleRunState.Starting) SetMessage(UiText.Get("starting"));
             }
-            UpdateStateInfo(); UpdateButtons(); UpdateCountdown();
+            var notice = notices.Observe(status.State, completedSummary?.RemainingCards == 0);
+            if (notice == RunNotice.Paused) ShowRunNotification(UiText.Get("notification_paused"), status.Error ?? UiText.Get("paused"), ToolTipIcon.Warning);
+            else if (notice == RunNotice.Completed) ShowRunNotification(UiText.Get("notification_completed"), UiText.Get("notification_completed_body"), ToolTipIcon.Info);
+            UpdateStateInfo(); UpdateButtons(); UpdateVisualWork();
+        }
+        private void ShowRunNotification(string title, string message, ToolTipIcon icon)
+        {
+            if (closing || IsDisposed || testSteamClientProbe != null) return;
+            // Shell notifications do not activate this window. Only clicking the notification restores it.
+            notifyIcon1.Visible = true;
+            try { notifyIcon1.ShowBalloonTip(5000, title, message, icon); }
+            catch (InvalidOperationException) { /* Windows can suppress notifications or remove the shell icon. */ }
         }
         public void StopIdle() { _ = StopSessionAsync(); }
         private async Task StopSessionAsync()
@@ -391,14 +425,15 @@ namespace IdleMasterExtended
             }
             finally { busy = false; UpdateButtons(); }
         }
-        private void PresentSessionSummary(bool completed)
+        private IdleSessionSummary PresentSessionSummary(bool completed)
         {
             var summary = sessionTracker.Finish(completed, elapsed.Elapsed);
-            if (summary == null || closing) return;
+            if (summary == null || closing) return null;
             if (deferredRunSettings) ready = false;
             var offerShutdown = completed && Settings.Default.ShutdownWindowsOnDone;
             if (offerShutdown) { Settings.Default.ShutdownWindowsOnDone = false; Settings.Default.Save(); }
             summaryPanel.Present(summary, offerShutdown);
+            return summary;
         }
         private async void btnPause_Click(object sender, EventArgs e)
         {
@@ -467,11 +502,12 @@ namespace IdleMasterExtended
         private void UpdateButtons()
         {
             if (closing || IsDisposed) return;
-            btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && steamClientIsRunning();
+            if (testSteamClientProbe != null) steamAvailable = testSteamClientProbe();
+            btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && steamAvailable && !steamAccountChanged;
             btnStart.Text = runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted ? UiText.Get("resume") : UiText.Get("start");
             btnStop.Enabled = !busy && sessionTracker.Active;
             btnPause.Enabled = !busy && Running; btnRefresh.Enabled = !busy && !Running && session.IsInitialized;
-            btnSkip.Enabled = !busy && Running && EffectiveMode != IdleMode.Fast && EffectiveMode != IdleMode.Whitelist;
+            btnSkip.Enabled = !busy && Running && runStatus?.GameplayActive != true && EffectiveMode != IdleMode.Fast && EffectiveMode != IdleMode.Whitelist;
             pauseIdlingToolStripMenuItem.Enabled = btnPause.Enabled; resumeIdlingToolStripMenuItem.Enabled = btnStart.Enabled;
             skipGameToolStripMenuItem.Enabled = btnSkip.Enabled; blacklistCurrentGameToolStripMenuItem.Enabled = Running && CurrentBadge != null;
             settingsToolStripMenuItem.Enabled = !busy; whitelistToolStripMenuItem.Enabled = blacklistToolStripMenuItem.Enabled = !busy;
@@ -486,6 +522,8 @@ namespace IdleMasterExtended
         internal void UpdateStateInfo()
         {
             if (closing || IsDisposed) return;
+            if (!VisualWorkAllowed) { visualStateDirty = true; return; }
+            visualStateDirty = false;
             var games = GamesForRun();
             lblDrops.Text = snapshotSteamId == 0 ? UiText.Get("cards_not_scanned") : EffectiveMode == IdleMode.Whitelist ? UiText.Get("whitelist_mode") : string.Format(UiText.Get("cards_remaining"), Math.Max(0, games.Sum(g => g.RemainingCards)));
             lblIdle.Text = string.Format(UiText.Get("games_available"), games.Count, runStatus?.ActiveGames.Count ?? 0);
@@ -509,6 +547,7 @@ namespace IdleMasterExtended
         }
         private void UpdateCountdown()
         {
+            if (!VisualWorkAllowed || closing) return;
             var next = runStatus?.NextCheckAt;
             lblTimer.Text = next.HasValue && Running ? (next.Value > DateTimeOffset.UtcNow ? next.Value - DateTimeOffset.UtcNow : TimeSpan.Zero).ToString(@"mm\:ss") : "";
             toolStripStatusLabel1.Visible = lblTimer.Visible = next.HasValue && Running;
@@ -516,10 +555,12 @@ namespace IdleMasterExtended
         private void SetMessage(string message) { if (!IsDisposed) lblCurrentStatus.Text = message; }
         private async Task LoadArtworkAsync(int id)
         {
-            if (artworkAppId == id && picApp.Image != null) return;
+            if (!VisualWorkAllowed || closing || artworkPendingAppId == id ||
+                (artworkAppId == id && picApp.Image != null) || artworkAttempts.Contains(id)) return;
             artworkCancellation?.Cancel(); artworkCancellation?.Dispose();
             artworkCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
             var token = artworkCancellation.Token;
+            artworkPendingAppId = id; artworkAttempts.Add(id);
             try
             {
                 byte[] bytes;
@@ -529,6 +570,7 @@ namespace IdleMasterExtended
                     bytes = await response.Content.ReadAsByteArrayAsync();
                 }
                 token.ThrowIfCancellationRequested();
+                if (closing || !VisualWorkAllowed || CurrentBadge?.AppId != id) return;
                 using (var stream = new System.IO.MemoryStream(bytes))
                 using (var image = Image.FromStream(stream))
                 {
@@ -536,8 +578,9 @@ namespace IdleMasterExtended
                 }
                 artworkAppId = id; UpdateStateInfo();
             }
-            catch (OperationCanceledException) { }
-            catch (Exception) { /* Optional artwork never changes readiness or card counts. */ }
+            catch (OperationCanceledException) { artworkAttempts.Remove(id); }
+            catch (Exception) { /* Optional artwork is tried once per session and never changes readiness or counts. */ }
+            finally { if (artworkPendingAppId == id) artworkPendingAppId = 0; }
         }
         private async Task CheckUpdatesAsync()
         {
@@ -552,19 +595,68 @@ namespace IdleMasterExtended
             }
             catch (Exception) { /* Updates are optional and cannot block startup. */ }
         }
-        private void CheckSteam()
+        private Task CheckSteamAsync()
         {
-            UpdateSteamClientStatus(steamClientIsRunning());
+            if (activityReadPending || closing) return activityRead;
+            activityReadPending = true;
+            activityRead = ReadSteamActivityAsync();
+            return activityRead;
         }
-        private void UpdateSteamClientStatus(bool available)
+        private async Task ReadSteamActivityAsync()
         {
-            lblSteamStatus.Text = available ? localization.strings.steam_running : localization.strings.steam_notrunning;
-            picSteamStatus.Image = StatusImage(available);
-            // The verified helper context owns account/lifetime checks. A broad client probe must not pause a live run.
+            try
+            {
+                if (testSteamClientProbe != null)
+                {
+                    steamAvailable = testSteamClientProbe(); UpdateSteamClientStatus(); return;
+                }
+                var owned = helpers?.GetOwnedProcessAppIds() ?? new Dictionary<int, int>();
+                var expected = session.Current?.SteamId ?? snapshotSteamId;
+                var observation = await Task.Run(() => steamActivity.Read(expected, owned.Values, owned.Keys), lifetime.Token);
+                if (closing || IsDisposed) return;
+                if (observation.Client != SteamClientPresence.Unknown)
+                    steamAvailable = observation.Client == SteamClientPresence.Present;
+                if (observation.Account != SteamAccountPresence.Unknown)
+                    steamAccountChanged = observation.Account == SteamAccountPresence.Changed;
+                if (observation.Client == SteamClientPresence.Present && observation.Account != SteamAccountPresence.Changed &&
+                    observation.Gameplay != SteamGameplayPresence.Unknown)
+                    controller?.UpdateGameActivity(observation.PlayingAppIds, observation.Gameplay == SteamGameplayPresence.Playing);
+                var reason = clientLoss.Observe(observation.Client, observation.Account, activityClock.Elapsed, Running);
+                UpdateSteamClientStatus();
+                if (reason != null && controller != null && Running)
+                    await controller.PauseAsync(UiText.Get(reason));
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                // An inaccessible registry/process observation is unknown, not a reason to interrupt a run.
+                Logger.Exception(ex, "Steam client observation");
+            }
+            finally { activityReadPending = false; }
+        }
+        private void UpdateSteamClientStatus()
+        {
+            lblSteamStatus.Text = steamAccountChanged ? UiText.Get("steam_account_mismatch") :
+                steamAvailable ? localization.strings.steam_running : localization.strings.steam_notrunning;
+            picSteamStatus.Image = StatusImage(steamAvailable && !steamAccountChanged);
             UpdateButtons();
         }
-        private void tmrCheckSteam_Tick(object sender, EventArgs e) => CheckSteam();
-        private void tmrStatistics_Tick(object sender, EventArgs e) { if (Running) statistics.increaseMinutesIdled(); }
+        private async void tmrCheckSteam_Tick(object sender, EventArgs e) => await CheckSteamAsync();
+        private void UpdateVisualWork()
+        {
+            if (closing || IsDisposed) return;
+            if (!VisualWorkAllowed)
+            {
+                displayTimer.Stop(); artworkCancellation?.Cancel(); visualStateDirty = true;
+                return;
+            }
+            if (visualStateDirty) UpdateStateInfo();
+            UpdateCountdown();
+            if (Running && runStatus?.NextCheckAt != null) displayTimer.Start();
+            else displayTimer.Stop();
+            if (Running && CurrentBadge != null) _ = LoadArtworkAsync(CurrentBadge.AppId);
+        }
+        private void tmrStatistics_Tick(object sender, EventArgs e) { if (Running && runStatus?.ActiveGames.Count > 0) statistics.increaseMinutesIdled(); }
         private void tmrReadyToGo_Tick(object sender, EventArgs e) { }
         private void tmrCardDropCheck_Tick(object sender, EventArgs e) { }
         private void tmrStartNext_Tick(object sender, EventArgs e) { }
@@ -577,17 +669,17 @@ namespace IdleMasterExtended
             e.Cancel = true;
             if (closing) return;
             closing = true; lifetime.Cancel(); scanCancellation?.Cancel(); artworkCancellation?.Cancel(); displayTimer.Stop();
-            try { if (controller != null) { await controller.StopAsync(); controller.Dispose(); } await scanGate.WaitAsync(); scanGate.Release(); await session.CloseAsync(); }
+            try { if (controller != null) { await controller.StopAsync(); controller.Dispose(); } await scanGate.WaitAsync(); scanGate.Release(); await activityRead; await session.CloseAsync(); }
             finally
             {
-                AllowSleep(); helpers?.Dispose(); artworkClient.Dispose();
+                AllowSleep(); helpers?.Dispose(); steamActivity.Dispose(); artworkClient.Dispose(); displayTimer.Dispose(); picApp.Image?.Dispose();
                 notifyIcon1.Visible = false; darkTrue.Dispose(); darkFalse.Dispose(); closeAllowed = true; Close();
             }
         }
         private void frmMain_Resize(object sender, EventArgs e)
         {
             if (WindowState == FormWindowState.Minimized && Settings.Default.minToTray) { notifyIcon1.Visible = true; Hide(); }
-            else if (WindowState == FormWindowState.Normal) notifyIcon1.Visible = false;
+            UpdateVisualWork();
         }
         private void notifyIcon1_MouseDoubleClick(object sender, MouseEventArgs e) { Show(); WindowState = FormWindowState.Normal; }
         private void ApplyTheme()
@@ -598,7 +690,7 @@ namespace IdleMasterExtended
             GamesState.BackColor = BackColor; GamesState.ForeColor = ForeColor; mnuTop.BackColor = BackColor; mnuTop.ForeColor = ForeColor;
             ssFooter.BackColor = BackColor; ssFooter.ForeColor = ForeColor;
             summaryPanel.ApplyTheme(BackColor, ForeColor, Settings.Default.customTheme);
-            picCookieStatus.Image = StatusImage(authenticated); picSteamStatus.Image = StatusImage(steamClientIsRunning());
+            picCookieStatus.Image = StatusImage(authenticated); picSteamStatus.Image = StatusImage(steamAvailable && !steamAccountChanged);
             foreach (var link in new[] { lnkSignIn, lnkResetCookies, switchAccount, lblCurrentStatus, lblGameName, lnkLatestRelease })
                 link.LinkColor = link.ForeColor = Settings.Default.customTheme ? Color.GhostWhite : Color.Blue;
         }
@@ -619,7 +711,7 @@ namespace IdleMasterExtended
             // preference can change immediately without tearing down the active helpers.
             if (sessionTracker.Active)
             {
-                if (Running && Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
+                if (Running && runStatus?.ActiveGames.Count > 0 && Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
                 else AllowSleep();
                 SetMessage(UiText.Get("settings_next_session"));
             }

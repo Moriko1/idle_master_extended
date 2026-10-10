@@ -33,8 +33,8 @@ using System.Runtime.InteropServices;
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
 [assembly: AssemblyVersion("1.12.0")]
-[assembly: AssemblyFileVersion("1.12.0.4")]
-[assembly: AssemblyInformationalVersion("1.12.0-preview.4")]
+[assembly: AssemblyFileVersion("1.12.0.5")]
+[assembly: AssemblyInformationalVersion("1.12.0-preview.5")]
 [assembly: NeutralResourcesLanguage("en")]
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("IdleMasterExtended.Tests")]

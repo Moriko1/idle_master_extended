@@ -5,7 +5,7 @@ Use Windows 10/11 x64, Visual Studio 2022 or newer with the .NET desktop workloa
 From the repository root:
 
     python scripts/build.py
-    python scripts/build.py --package --version 1.12.0-preview.4
+    python scripts/build.py --package --version 1.12.0-preview.5
 
 The script restores pinned NuGet packages, builds the helper before the application, and runs the x64 regression console. Packaging requires a clean Git checkout so the source ZIP corresponds to the binaries. The portable ZIP, source ZIP, and SHA256SUMS.txt are written to dist/.
 
@@ -22,6 +22,8 @@ The test console accepts --live-session to verify the existing application-owned
 ## Manual release checks
 
 Sign in through Steam's official window, including any Steam Guard/QR challenge. Close and reopen the application and confirm the remembered account is verified without starting helpers. Select Start and check that the Steam desktop client has the same account. Pause, resume manually, and sign out while running. Each stop must leave no helpers created by this application.
+
+While a queue is running, launch a Steam game. Confirm only games with verified hours below the estimated two-hour threshold warm up, stop at their remaining budget, and wait without finishing the queue when all are warm. Close the game and confirm normal card idling returns automatically. Test a same-app launch and a game using a third-party launcher. Exit Steam: helpers should stop, the queue should pause, and Windows should offer a notification without restoring Idle Master. A momentary network disconnect should reconnect automatically instead. Confirm actual zero remaining cards produces a completion notification and in-app summary, while skipping the last unfinished game does not claim zero cards.
 
 Check 100%, 125%, 150%, and 200% display scaling; run from an unrelated working directory and a read-only extracted application directory. Settings, diagnostics, and the browser profile should remain under LocalAppData.
 

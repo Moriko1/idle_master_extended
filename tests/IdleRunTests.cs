@@ -37,7 +37,341 @@ namespace IdleMasterExtended.Tests
             await WrongAccountNeverRunsAsync();
             await RapidRepeatedControlsSerializeAsync();
             await MissingHelperIsReportedAsync();
+            await GameplayPreparesAcrossModesAsync();
+            await PreparationStopsAtLocalDeadlinesAsync();
+            await PreparationDeadlineSurvivesPendingFailedScanAsync();
+            await PreparationDeadlinesWatchPendingStartupAsync();
+            await GameplayCapsPreparationAndKeepsQueueAsync();
+            await GameplayInterruptsFastGapAsync();
+            await GameplayCancelsPendingLaunchAsync();
+            await GameplayChangesNeverResumeManualPauseAsync();
+            await RecoverableHelpersRestartWithoutPausingAsync();
+            await RecoverableStartupRetriesAndStopCancelsAsync();
+            await PersistentInitializationFailureNeedsRecoveryAsync();
+            await TypedAccountMismatchStopsSafelyAsync();
             OwnedJobClosesOnlyItsChild();
+        }
+
+        private static async Task GameplayPreparesAcrossModesAsync()
+        {
+            foreach (IdleMode mode in Enum.GetValues(typeof(IdleMode)))
+            {
+                var factory = new FakeFactory();
+                var clock = new AdvancingClock();
+                var games = mode == IdleMode.Whitelist
+                    ? new[] { Game(1, -1), Game(2, -1), Game(3, -1) }
+                    : new[] { Game(1, 3, 2), Game(2, 3, 0.5), Game(3, 3, 0.5) };
+                using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+                {
+                    run.UpdateGameActivity(new[] { 3 }, true);
+                    await run.StartAsync(games, SteamId, mode);
+                    await Until(() => run.Snapshot.State == IdleRunState.Running && clock.PendingCount > 0,
+                        "gameplay preparation for " + mode);
+                    Assert(run.Snapshot.GameplayActive && run.Snapshot.RemainingGames.Count == 3,
+                        "Gameplay must retain the verified card queue in every mode.");
+                    Assert(mode == IdleMode.Whitelist ? factory.ActiveCount == 0 :
+                        factory.ActiveCount == 1 && factory.IsActive(2),
+                        "Only young card games may prepare during gameplay; the actual game and unknown whitelist hours wait.");
+                    run.UpdateGameActivity(new int[0], false);
+                    await Until(() => !run.Snapshot.GameplayActive && (mode == IdleMode.ManyThenOne
+                        ? factory.IsActive(2) && factory.IsActive(3) : factory.IsActive(1)),
+                        "automatic normal policy after gameplay for " + mode);
+                    Assert(run.Snapshot.State != IdleRunState.Paused && factory.MaximumActive <= 30,
+                        "Ending gameplay resumes the chosen mode automatically without a manual control.");
+                    await run.StopAsync();
+                    Assert(factory.ActiveCount == 0 && clock.PendingCount == 0,
+                        "Stop must cancel both preparation deadlines and ordinary waits.");
+                }
+            }
+        }
+
+        private static async Task PreparationStopsAtLocalDeadlinesAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var games = new[] { Game(1, 3, 1.99), Game(2, 4, 1.98) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                run.UpdateGameActivity(new int[0], true);
+                await run.StartAsync(games, SteamId, IdleMode.Fast);
+                await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 2, "two preparation deadlines");
+                clock.ShiftWallClock(TimeSpan.FromDays(-1));
+                clock.AdvanceNext();
+                await Until(() => !factory.IsActive(1) && factory.IsActive(2), "first game reaches two hours");
+                Assert(run.Snapshot.RemainingGames.Count == 2 && run.Snapshot.RemainingGames.Sum(game => game.RemainingCards) == 7,
+                    "A preparation threshold cannot invent card drops or remove a queued game.");
+                clock.ShiftWallClock(TimeSpan.FromDays(2));
+                run.UpdateGameActivity(new[] { 999 }, true);
+                await Until(() => factory.IsActive(2) && clock.PendingCount == 2, "monotonic budget after clock correction");
+                Assert(factory.StartCount == 2,
+                    "Wall-clock changes must not extend, shorten, or restart a preparation budget.");
+                clock.AdvanceNext();
+                await Until(() => factory.ActiveCount == 0 && clock.PendingCount == 1, "second preparation threshold");
+                clock.AdvanceNext();
+                await Until(() => clock.PendingCount == 1 && run.Snapshot.State == IdleRunState.Running,
+                    "stale badge hours after preparation");
+                Assert(factory.StartCount == 2 && run.Snapshot.GameplayActive && run.Snapshot.ActiveGames.Count == 0,
+                    "Stale scan hours must not restart warmed games, cycle solos, or claim completion while the user plays.");
+                run.UpdateGameActivity(new int[0], false);
+                await Until(() => factory.ActiveCount == 2, "normal fast mode after all games warm");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task PreparationDeadlineSurvivesPendingFailedScanAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var games = new[] { Game(1, 3, 1.8) };
+            var scan = new TaskCompletionSource<IReadOnlyList<IdleGame>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = false;
+            using (var run = new IdleRunController(factory, token => { entered = true; return scan.Task; }, clock))
+            {
+                run.UpdateGameActivity(new int[0], true);
+                await run.StartAsync(games, SteamId, IdleMode.Single);
+                await Until(() => factory.ActiveCount == 1 && clock.PendingCount == 2, "pending scan preparation setup");
+                clock.AdvanceNext();
+                await Until(() => entered && clock.PendingCount == 1, "HTTP scan pending before warmup deadline");
+                clock.AdvanceNext();
+                await Until(() => factory.ActiveCount == 0, "warmup ends while HTTP scan is pending");
+                Assert(!scan.Task.IsCompleted && run.Snapshot.RemainingGames.Single().RemainingCards == 3,
+                    "An unresponsive scan cannot leave a game idling beyond the preparation budget.");
+                scan.TrySetException(new IdleRefreshException(SteamReadStatus.TransientFailure, "Synthetic timeout"));
+                await Until(() => clock.PendingCount == 1 && run.Snapshot.ReadFailure == SteamReadStatus.TransientFailure,
+                    "failed scan after preparation deadline");
+                Assert(factory.StartCount == 1 && run.Snapshot.State == IdleRunState.Running,
+                    "A failed read after preparation must retain the queue and keep warmed helpers stopped.");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task GameplayCapsPreparationAndKeepsQueueAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var games = Enumerable.Range(1, 31).Select(id => Game(id, 2, 1.999)).ToArray();
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                run.UpdateGameActivity(new int[0], true);
+                await run.StartAsync(games, SteamId, IdleMode.Single);
+                await Until(() => factory.ActiveCount == 30 && clock.PendingCount == 2, "thirty-game preparation cap");
+                Assert(factory.MaximumActive == 30 && run.Snapshot.RemainingGames.Count == 31,
+                    "All modes use at most thirty preparation helpers while additional games remain queued.");
+                clock.AdvanceNext();
+                await Until(() => factory.IsActive(31) && clock.PendingCount == 2, "remaining preparation game");
+                Assert(factory.StartCount == 31 && factory.MaximumActive == 30,
+                    "Stale badge data cannot restart the first thirty games instead of preparing the remaining game.");
+                clock.AdvanceNext();
+                await Until(() => factory.ActiveCount == 0, "last preparation game stops");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Count == 31,
+                    "Completing preparation cannot complete a positive card queue.");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task PreparationDeadlinesWatchPendingStartupAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var first = new FakeHelper(1, SteamId, null);
+            var late = new TaskCompletionSource<IIdleHelper>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pendingToken = default(CancellationToken);
+            var released = 0;
+            factory.StartOverride = (app, steam, token) =>
+            {
+                if (app == 1) return Task.FromResult<IIdleHelper>(first);
+                pendingToken = token;
+                return late.Task;
+            };
+            var games = new[] { Game(1, 3, 1.999), Game(2, 4, 1.998) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                run.UpdateGameActivity(new int[0], true);
+                await run.StartAsync(games, SteamId, IdleMode.ManyThenOne);
+                await Until(() => factory.Attempts == 2 && clock.PendingCount == 1 && first.IsRunning,
+                    "second helper startup pending");
+                clock.AdvanceNext();
+                await Until(() => !first.IsRunning && clock.PendingCount == 1, "first warmup cap during later startup");
+                Assert(!late.Task.IsCompleted && !pendingToken.IsCancellationRequested,
+                    "An accepted helper must stop at its own cap while a later helper is still initializing.");
+                clock.AdvanceNext();
+                await Until(() => pendingToken.IsCancellationRequested && run.Snapshot.State == IdleRunState.Running &&
+                    clock.PendingCount == 1, "pending helper reaches its conservative warmup cap");
+                Assert(run.Snapshot.ActiveGames.Count == 0 && run.Snapshot.RemainingGames.Count == 2 && factory.Attempts == 2,
+                    "Startup time consumes the preparation budget and cannot become card completion or repeated warmup launches.");
+                late.TrySetResult(new FakeHelper(2, SteamId, () => Interlocked.Increment(ref released)));
+                await Until(() => released == 1, "late readiness after preparation startup deadline");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task GameplayInterruptsFastGapAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var games = new[] { Game(1, 3, 2), Game(2, 3, 0.5) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                await run.StartAsync(games, SteamId, IdleMode.Fast);
+                await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 1, "fast pre-game batch");
+                clock.AdvanceNext();
+                await Until(() => factory.ActiveCount == 0 && clock.PendingCount == 1, "fast pre-game solo gap");
+                run.UpdateGameActivity(new[] { 1 }, true);
+                await Until(() => factory.IsActive(2) && clock.PendingCount == 2, "gameplay interrupts fast solo gap");
+                Assert(!factory.IsActive(1) && run.Snapshot.GameplayActive && run.Snapshot.State == IdleRunState.Running,
+                    "Gameplay must cancel a queued fast solo transition and prepare only eligible games immediately.");
+                await run.StopAsync();
+            }
+        }
+
+        private static async Task GameplayCancelsPendingLaunchAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var pending = new TaskCompletionSource<IIdleHelper>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pendingToken = default(CancellationToken);
+            var released = 0;
+            var retained = new FakeHelper(2, SteamId, null);
+            factory.StartOverride = (app, steam, token) =>
+            {
+                if (app == 1) { pendingToken = token; return pending.Task; }
+                return Task.FromResult<IIdleHelper>(retained);
+            };
+            var games = new[] { Game(1), Game(2) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                await run.StartAsync(games, SteamId, IdleMode.ManyThenOne);
+                await Until(() => factory.Attempts == 1, "launch pending before actual game");
+                run.UpdateGameActivity(new[] { 1 }, true);
+                await Until(() => retained.IsRunning && factory.Attempts == 2 && clock.PendingCount == 2,
+                    "preparation continues after canceled game launch");
+                Assert(pendingToken.IsCancellationRequested && run.Snapshot.ActiveGames.Single().AppId == 2,
+                    "Launching the same game must cancel the pending helper and retain unrelated preparation.");
+                pending.TrySetResult(new FakeHelper(1, SteamId, () => Interlocked.Increment(ref released)));
+                await Until(() => released == 1, "late gameplay helper disposal");
+                Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Count == 2,
+                    "Late readiness cannot crash or overwrite gameplay policy.");
+                await run.StopAsync();
+                Assert(!retained.IsRunning && clock.PendingCount == 0, "Stop cancels remaining preparation and waits.");
+            }
+        }
+
+        private static async Task GameplayChangesNeverResumeManualPauseAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var games = new[] { Game(1) };
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+            {
+                await run.StartAsync(games, SteamId, IdleMode.Single);
+                await Until(() => factory.ActiveCount == 1 && clock.PendingCount == 1, "manual pause before game changes");
+                await run.PauseAsync("Steam was closed.");
+                var starts = factory.StartCount;
+                for (var index = 0; index < 16; index++)
+                    run.UpdateGameActivity(index % 2 == 0 ? new[] { 1 } : new int[0], index % 2 == 0);
+                await Task.Delay(30);
+                Assert(run.Snapshot.State == IdleRunState.Paused && run.Snapshot.Error == "Steam was closed." &&
+                    factory.ActiveCount == 0 && factory.StartCount == starts && clock.PendingCount == 0,
+                    "Gameplay changes cannot undo a manual or confirmed-client-exit pause.");
+                await run.StopAsync();
+                run.UpdateGameActivity(new int[0], true);
+                run.UpdateGameActivity(new int[0], false);
+                Assert(run.Snapshot.State == IdleRunState.Stopped && factory.ActiveCount == 0,
+                    "Ending gameplay cannot restart a stopped session.");
+            }
+        }
+
+        private static async Task RecoverableHelpersRestartWithoutPausingAsync()
+        {
+            foreach (var failure in new[] { IdleHelperFailure.SteamUnavailable, IdleHelperFailure.UnexpectedExit })
+            {
+                var factory = new FakeFactory();
+                var clock = new FakeClock();
+                var games = new[] { Game(1, 3), Game(2, 4) };
+                using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(games), clock))
+                {
+                    await run.StartAsync(games, SteamId, IdleMode.ManyThenOne);
+                    await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 1, "recoverable helper setup");
+                    factory.Fail(1, failure);
+                    await Until(() => factory.ActiveCount == 0 && clock.PendingCount == 1 && run.Snapshot.Error != null,
+                        "recoverable helper retry " + failure);
+                    Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Sum(game => game.RemainingCards) == 7 &&
+                        clock.NextDelay == TimeSpan.FromSeconds(5),
+                        "Brief helper failures retry automatically, retaining the previous verified queue.");
+                    clock.ReleaseNext();
+                    await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 1 && factory.StartCount == 4,
+                        "automatic helper recovery " + failure);
+                    Assert(run.Snapshot.Error == null && !factory.DuplicateActive,
+                        "Successful recovery clears the transient status without overlapping helpers.");
+                    await run.StopAsync();
+                }
+            }
+        }
+
+        private static async Task RecoverableStartupRetriesAndStopCancelsAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            factory.StartOverride = (app, steam, token) => Task.FromException<IIdleHelper>(
+                new IdleHelperException("Synthetic initialization failure", IdleHelperFailure.InitializationFailed));
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(new[] { Game(1) }), clock))
+            {
+                await run.StartAsync(new[] { Game(1) }, SteamId, IdleMode.Single);
+                await Until(() => factory.Attempts == 1 && clock.PendingCount == 1, "initialization retry");
+                Assert(run.Snapshot.State == IdleRunState.Running && clock.NextDelay == TimeSpan.FromSeconds(5),
+                    "Transient Steam initialization failures must not demand a manual restart.");
+                clock.ReleaseNext();
+                await Until(() => factory.Attempts == 2 && clock.PendingCount == 1, "second initialization retry");
+                Assert(clock.NextDelay == TimeSpan.FromSeconds(10), "Repeated initialization failures use a bounded backoff.");
+                await run.StopAsync();
+                var attempts = factory.Attempts;
+                await Task.Delay(30);
+                Assert(run.Snapshot.State == IdleRunState.Stopped && clock.PendingCount == 0 && factory.Attempts == attempts,
+                    "Manual Stop must cancel retry delays and prevent late relaunches.");
+            }
+        }
+
+        private static async Task TypedAccountMismatchStopsSafelyAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(new[] { Game(1) }), clock))
+            {
+                await run.StartAsync(new[] { Game(1) }, SteamId, IdleMode.Single);
+                await Until(() => factory.ActiveCount == 1 && clock.PendingCount == 1, "typed mismatch setup");
+                factory.Fail(1, IdleHelperFailure.AccountMismatch);
+                await Until(() => run.Snapshot.State == IdleRunState.Faulted, "typed account mismatch");
+                Assert(factory.ActiveCount == 0 && clock.PendingCount == 0 && factory.StartCount == 1 &&
+                    run.Snapshot.RemainingGames.Single().RemainingCards == 2,
+                    "An account mismatch cannot auto-retry or discard the retained card counts.");
+            }
+        }
+
+        private static async Task PersistentInitializationFailureNeedsRecoveryAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new FakeClock();
+            factory.StartOverride = (app, steam, token) => Task.FromException<IIdleHelper>(
+                new IdleHelperException("Synthetic unavailable game", IdleHelperFailure.InitializationFailed));
+            using (var run = new IdleRunController(factory, token => Task.FromResult<IReadOnlyList<IdleGame>>(
+                new[] { Game(1, 3), Game(2, 4) }), clock))
+            {
+                await run.StartAsync(new[] { Game(1, 3), Game(2, 4) }, SteamId, IdleMode.ManyThenOne);
+                for (var attempt = 1; attempt <= 5; attempt++)
+                {
+                    var expected = attempt;
+                    await Until(() => factory.Attempts == expected && clock.PendingCount == 1,
+                        "bounded unavailable-game retry " + attempt);
+                    Assert(run.Snapshot.State == IdleRunState.Running, "Brief initialization failures retry automatically.");
+                    clock.ReleaseNext();
+                }
+                await Until(() => factory.Attempts == 6 && run.Snapshot.State == IdleRunState.Faulted,
+                    "persistent unavailable game recovery state");
+                Assert(clock.PendingCount == 0 && factory.ActiveCount == 0 &&
+                    run.Snapshot.RemainingGames.Sum(game => game.RemainingCards) == 7 &&
+                    run.Snapshot.Error.Contains("several retries"),
+                    "A persistently unavailable game must retain counts and request recovery instead of retrying forever or completing.");
+            }
         }
 
         private static IdleGame Game(int id, int cards = 2, double hours = 0)
@@ -775,6 +1109,49 @@ namespace IdleMasterExtended.Tests
             }
         }
 
+        private sealed class AdvancingClock : IIdleClock, IMonotonicIdleClock
+        {
+            private readonly object sync = new object();
+            private readonly List<Delay> delays = new List<Delay>();
+            private DateTimeOffset now = new DateTimeOffset(2026, 10, 10, 0, 0, 0, TimeSpan.Zero);
+            private TimeSpan wallOffset;
+            public DateTimeOffset UtcNow { get { lock (sync) return now.Add(wallOffset); } }
+            public TimeSpan Elapsed
+            { get { lock (sync) return now - new DateTimeOffset(2026, 10, 10, 0, 0, 0, TimeSpan.Zero); } }
+            public int PendingCount { get { lock (sync) return delays.Count(delay => !delay.Source.Task.IsCompleted); } }
+
+            public Task DelayAsync(TimeSpan duration, CancellationToken token)
+            {
+                Delay delay;
+                lock (sync)
+                {
+                    delay = new Delay { Due = now.Add(duration),
+                        Source = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+                    delays.Add(delay);
+                }
+                token.Register(() => delay.Source.TrySetCanceled());
+                return delay.Source.Task;
+            }
+
+            public void AdvanceNext()
+            {
+                lock (sync)
+                {
+                    now = delays.Where(delay => !delay.Source.Task.IsCompleted).Min(delay => delay.Due);
+                    foreach (var delay in delays.Where(delay => !delay.Source.Task.IsCompleted && delay.Due <= now))
+                        delay.Source.TrySetResult(true);
+                }
+            }
+
+            public void ShiftWallClock(TimeSpan adjustment) { lock (sync) wallOffset += adjustment; }
+
+            private sealed class Delay
+            {
+                public DateTimeOffset Due;
+                public TaskCompletionSource<bool> Source;
+            }
+        }
+
         private sealed class FakeFactory : IIdleHelperFactory
         {
             private readonly object sync = new object();
@@ -807,9 +1184,9 @@ namespace IdleMasterExtended.Tests
                 lock (sync) return helpers.Any(helper => helper.AppId == appId && helper.IsRunning);
             }
 
-            public void Fail(int appId)
+            public void Fail(int appId, IdleHelperFailure failure = IdleHelperFailure.Unknown)
             {
-                lock (sync) helpers.Last(helper => helper.AppId == appId && helper.IsRunning).Fail();
+                lock (sync) helpers.Last(helper => helper.AppId == appId && helper.IsRunning).Fail(failure);
             }
         }
 
@@ -828,7 +1205,8 @@ namespace IdleMasterExtended.Tests
                 SteamId = steamId;
                 this.disposed = disposed;
             }
-            public void Fail() { completion.TrySetException(new IdleHelperException("Steam disconnected.")); }
+            public void Fail(IdleHelperFailure failure = IdleHelperFailure.Unknown)
+            { completion.TrySetException(new IdleHelperException("Steam disconnected.", failure)); }
             public void Dispose()
             {
                 completion.TrySetResult(true);

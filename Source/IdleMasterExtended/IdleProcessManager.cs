@@ -37,7 +37,7 @@ namespace IdleMasterExtended
             cancellationToken.ThrowIfCancellationRequested();
             lock (sync) if (disposed) throw new ObjectDisposedException(nameof(IdleProcessManager));
             if (!File.Exists(executablePath))
-                throw new IdleHelperException("steam-idle.exe is missing. Extract the complete application package.");
+                throw new IdleHelperException("steam-idle.exe is missing. Extract the complete application package.", IdleHelperFailure.InvalidProtocol);
 
             var pipeName = "SteamIdle_" + Guid.NewGuid().ToString("N");
             var security = new PipeSecurity();
@@ -86,16 +86,16 @@ namespace IdleMasterExtended
                     var completed = await Task.WhenAny(ready, helper.Completion, timeout).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
                     if (completed == timeout)
-                        throw new IdleHelperException("The idling helper did not become ready. Check Steam is running and signed in.");
+                        throw new IdleHelperException("The idling helper did not become ready. Check Steam is running and signed in.", IdleHelperFailure.InitializationFailed);
                     if (completed == helper.Completion)
                     {
                         await helper.Completion.ConfigureAwait(false);
-                        throw new IdleHelperException("The idling helper stopped before becoming ready.");
+                        throw new IdleHelperException("The idling helper stopped before becoming ready.", IdleHelperFailure.UnexpectedExit);
                     }
                     await ready.ConfigureAwait(false);
                     if (helper.Completion.IsCompleted) await helper.Completion.ConfigureAwait(false);
                     if (!helper.IsRunning)
-                        throw new IdleHelperException("The idling helper stopped before becoming ready.");
+                        throw new IdleHelperException("The idling helper stopped before becoming ready.", IdleHelperFailure.UnexpectedExit);
                 }
                 finally
                 {
@@ -107,6 +107,14 @@ namespace IdleMasterExtended
         }
 
         private void Remove(OwnedIdleHelper helper) { lock (sync) owned.Remove(helper); }
+
+        // Read-only process identity for the local activity monitor. These PIDs
+        // are captured when this app creates each helper, including startup.
+        public IReadOnlyDictionary<int, int> GetOwnedProcessAppIds()
+        {
+            lock (sync) return new System.Collections.ObjectModel.ReadOnlyDictionary<int, int>(
+                owned.ToDictionary(helper => helper.ProcessId, helper => helper.AppId));
+        }
 
         public void Dispose()
         {
@@ -133,6 +141,7 @@ namespace IdleMasterExtended
             private StreamReader reader;
             private bool disposed;
             public int AppId { get; private set; }
+            internal int ProcessId { get; private set; }
             public ulong SteamId { get; private set; }
             public Task Completion { get { return completion.Task; } }
             public bool IsRunning
@@ -152,6 +161,7 @@ namespace IdleMasterExtended
                 NamedPipeServerStream pipe, Action<OwnedIdleHelper> removed)
             {
                 AppId = appId;
+                ProcessId = process.Id;
                 this.process = process;
                 this.job = job;
                 this.pipe = pipe;
@@ -166,16 +176,20 @@ namespace IdleMasterExtended
                 await pipe.WaitForConnectionAsync().ConfigureAwait(false);
                 reader = new StreamReader(pipe, new UTF8Encoding(false), false, 1024, true);
                 var line = await reader.ReadLineAsync().ConfigureAwait(false);
+                if (line == null)
+                    throw new IdleHelperException("The idling helper stopped before becoming ready.", IdleHelperFailure.UnexpectedExit);
                 if (line != null && line.StartsWith("ERROR ", StringComparison.Ordinal))
-                    throw new IdleHelperException(ErrorMessage(line.Substring(6)));
+                    throw Error(line.Substring(6));
                 var fields = (line ?? "").Split(' ');
                 int appId;
                 ulong steamId;
                 if (fields.Length != 3 || fields[0] != "READY" ||
                     !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out appId) ||
                     !ulong.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out steamId) ||
-                    appId != AppId || steamId != expectedSteamId)
-                    throw new IdleHelperException("The idling helper reported an invalid game or Steam account.");
+                    appId != AppId || steamId == 0)
+                    throw new IdleHelperException("The idling helper reported an invalid game or Steam account.", IdleHelperFailure.InvalidProtocol);
+                if (steamId != expectedSteamId)
+                    throw new IdleHelperException("The idling helper is using a different Steam account.", IdleHelperFailure.AccountMismatch);
                 SteamId = steamId;
             }
 
@@ -195,22 +209,23 @@ namespace IdleMasterExtended
                         lock (sync) if (disposed) return;
                         if (line == null)
                         {
-                            Fail("The idling helper lost its connection. Check Steam and try again.");
+                            Fail("The idling helper lost its connection. Check Steam and try again.", IdleHelperFailure.UnexpectedExit);
                             return;
                         }
                         if (line.StartsWith("ERROR ", StringComparison.Ordinal))
                         {
-                            Fail(ErrorMessage(line.Substring(6)));
+                            var error = Error(line.Substring(6));
+                            Fail(error.Message, error.Failure);
                             return;
                         }
-                        Fail("The idling helper reported an invalid status.");
+                        Fail("The idling helper reported an invalid status.", IdleHelperFailure.InvalidProtocol);
                         return;
                     }
                 }
                 catch (Exception)
                 {
                     lock (sync) if (disposed) return;
-                    Fail("The idling helper lost its connection. Check Steam and try again.");
+                    Fail("The idling helper lost its connection. Check Steam and try again.", IdleHelperFailure.UnexpectedExit);
                 }
             }
 
@@ -219,15 +234,15 @@ namespace IdleMasterExtended
                 // Give a buffered ERROR line a chance to preserve its actionable reason.
                 await Task.Delay(50).ConfigureAwait(false);
                 lock (sync) if (disposed) return;
-                Fail("The idling helper exited unexpectedly. Check Steam and try again.");
+                Fail("The idling helper exited unexpectedly. Check Steam and try again.", IdleHelperFailure.UnexpectedExit);
             }
 
-            private void Fail(string reason)
+            private void Fail(string reason, IdleHelperFailure failure)
             {
                 lock (sync)
                 {
                     if (disposed) return;
-                    completion.TrySetException(new IdleHelperException(reason));
+                    completion.TrySetException(new IdleHelperException(reason, failure));
                 }
                 Dispose();
             }
@@ -240,26 +255,40 @@ namespace IdleMasterExtended
                     disposed = true;
                     process.Exited -= ProcessExited;
                     completion.TrySetResult(true);
-                    job.Dispose();
-                    pipe.Dispose();
-                    if (reader != null) reader.Dispose();
-                    process.Dispose();
+                    // An exit callback runs on a worker thread. Cleanup errors
+                    // must neither crash the app nor prevent the remaining
+                    // owned handles from being released.
+                    DisposeResource(job);
+                    DisposeResource(pipe);
+                    if (reader != null) DisposeResource(reader);
+                    DisposeResource(process);
                 }
                 removed(this);
             }
 
-            private static string ErrorMessage(string code)
+            private static void DisposeResource(IDisposable resource)
             {
-                switch (code)
-                {
-                    case "ACCOUNT_MISMATCH": return "Steam is signed in to a different account. Switch accounts and try again.";
-                    case "STEAM_OFFLINE":
-                    case "STEAM_DISCONNECTED": return "Steam disconnected or signed out. Sign in to Steam and try again.";
-                    case "INITIALIZATION_FAILED": return "Steam could not initialize. Check Steam is running and uses the same Windows user and elevation.";
-                    case "PARENT_EXITED": return "The application that started this helper closed.";
-                    case "INVALID_ARGUMENTS": return "The idling helper received invalid startup arguments.";
-                    default: return "The idling helper failed. Check Steam and try again.";
-                }
+                try { resource.Dispose(); }
+                catch (Exception ex) { Logger.Exception(ex, "Helper cleanup"); }
+            }
+
+            private static IdleHelperException Error(string code)
+            {
+                return DecodeHelperError(code);
+            }
+        }
+
+        internal static IdleHelperException DecodeHelperError(string code)
+        {
+            switch (code)
+            {
+                case "ACCOUNT_MISMATCH": return new IdleHelperException("Steam is signed in to a different account. Switch accounts and try again.", IdleHelperFailure.AccountMismatch);
+                case "STEAM_OFFLINE":
+                case "STEAM_DISCONNECTED": return new IdleHelperException("Steam disconnected or signed out. Sign in to Steam and try again.", IdleHelperFailure.SteamUnavailable);
+                case "INITIALIZATION_FAILED": return new IdleHelperException("Steam could not initialize. Check Steam is running and uses the same Windows user and elevation.", IdleHelperFailure.InitializationFailed);
+                case "PARENT_EXITED": return new IdleHelperException("The application that started this helper closed.", IdleHelperFailure.ParentExited);
+                case "INVALID_ARGUMENTS": return new IdleHelperException("The idling helper received invalid startup arguments.", IdleHelperFailure.InvalidProtocol);
+                default: return new IdleHelperException("The idling helper reported an invalid failure status. Check Steam and try again.", IdleHelperFailure.InvalidProtocol);
             }
         }
     }

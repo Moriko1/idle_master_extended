@@ -306,8 +306,9 @@ namespace IdleMasterExtended.Tests
                     SetField(main, "runMode", IdleMode.Single);
                     Field<IdleSessionTracker>(main, "sessionTracker").Start(games, IdleMode.Single);
                     main.AllBadges.Add(new Badge { AppId = 1, Name = "Game 1", RemainingCard = 4, HoursPlayed = 2 });
+                    SetField(main, "steamAvailable", false);
                     main.GetType().GetMethod("UpdateSteamClientStatus", BindingFlags.NonPublic | BindingFlags.Instance)
-                        .Invoke(main, new object[] { false });
+                        .Invoke(main, new object[0]);
                     Test.Assert(run.Snapshot.State == IdleRunState.Running && factory.Helper.IsRunning,
                         "A false broad Steam-client probe must not automatically pause or stop a verified run.");
                     var edit = main.GetType().GetMethod("EditAndRefreshAsync", BindingFlags.NonPublic | BindingFlags.Instance);

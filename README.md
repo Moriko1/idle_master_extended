@@ -28,7 +28,10 @@ Your Community login must match the account in the running Steam client.
 
 - **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
 - Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
-- Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings.
+- When you launch a Steam game, every mode switches to preparation only: known games below the estimated two-hour threshold can warm up, then their helpers stop. Card idling returns automatically when your game closes. Ready games and whitelist entries with unknown hours wait while you play; the queue stays active. The game you are playing is excluded when its app ID can be detected.
+- Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings; their normal behavior returns outside gameplay.
+- Brief client/connection uncertainty is retried automatically. A confirmed Steam exit or account change stops helpers and keeps the queue paused for manual Resume. Repeated helper initialization failures also retain the queue and request recovery after several automatic retries. Pauses and verified zero-card completion request Windows notifications; Windows notification settings and Focus Assist control delivery. Summaries remain inside Idle Master and do not activate its window.
+- Background and minimized windows defer artwork, list rebuilding and countdown repainting. Client/game detection runs off the UI thread, and owned helpers run at BelowNormal priority.
 - Whitelist mode has no automatic card completion; stop it manually. Its queue ends if all entries become private. At most 30 games run together.
 - Games marked Private on Steam are skipped in every mode, including Whitelist, because [Steam does not award them card drops](https://help.steampowered.com/en/faqs/view/1150-C06F-4D62-4966). The app verifies the account's private list before Start/Resume and on periodic queue refreshes. A failed check preserves the previous snapshot and retries; it cannot prove completion.
 - Show Steam username defaults to on. Saved preferences survive restarts and portable-folder upgrades.

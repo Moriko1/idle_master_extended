@@ -23,17 +23,31 @@ namespace IdleMasterExtended
         Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken);
     }
 
-    public sealed class SystemIdleClock : IIdleClock
+    public sealed class SystemIdleClock : IIdleClock, IMonotonicIdleClock
     {
+        private readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         public DateTimeOffset UtcNow { get { return DateTimeOffset.UtcNow; } }
+        public TimeSpan Elapsed { get { return clock.Elapsed; } }
         public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
         {
             return Task.Delay(delay, cancellationToken);
         }
     }
 
+    public enum IdleHelperFailure
+    {
+        Unknown, SteamUnavailable, InitializationFailed, UnexpectedExit,
+        AccountMismatch, ParentExited, InvalidProtocol
+    }
+
     public sealed class IdleHelperException : Exception
     {
-        public IdleHelperException(string message) : base(message) { }
+        public IdleHelperFailure Failure { get; private set; }
+
+        public IdleHelperException(string message, IdleHelperFailure failure = IdleHelperFailure.Unknown)
+            : base(message)
+        {
+            Failure = failure;
+        }
     }
 }

@@ -44,14 +44,14 @@ namespace IdleMasterExtended.Tests
                     Settings.Default.customTheme = Settings.Default.whiteIcons = dark;
                     Settings.Default.colorBgd = Color.FromArgb(38, 38, 38);
                     Settings.Default.colorTxt = Color.FromArgb(196, 196, 196);
-                    using (var form = new frmMain())
+                    using (var form = new frmMain(() => true))
                     {
                         bool loadFired = false;
                         form.Load += (sender, args) => loadFired = true;
                         Invoke(form, "SetLanguage");
                         Invoke(form, "LocalizeMenus");
                         Invoke(form, "ApplyTheme");
-                        Invoke(form, "CheckSteam");
+                        Invoke(form, "UpdateSteamClientStatus");
                         form.AllBadges.Add(new Badge { AppId = 20, Name = "Synthetic private game", RemainingCard = -1, IsPrivate = true });
                         form.UpdateStateInfo();
                         Invoke(form, "UpdateCountdown");
@@ -83,6 +83,14 @@ namespace IdleMasterExtended.Tests
                         if (measured.Height > status.ClientSize.Height)
                             issues.Add(suffix + ": long failure status requires " + measured.Height +
                                 "px, available " + status.ClientSize.Height + "px.");
+                        foreach (var key in new[] { "gaming_warmup", "gaming_waiting", "steam_closed_pause", "steam_account_changed_pause" })
+                        {
+                            Invoke(form, "SetMessage", UiText.Get(key));
+                            Save(form, Path.Combine(output, "ui-main-" + suffix + "-" + key + ".png"));
+                            var required = TextRenderer.MeasureText(status.Text, status.Font,
+                                new Size(status.ClientSize.Width, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                            if (required.Height > status.ClientSize.Height) issues.Add(suffix + ": " + key + " clips.");
+                        }
                         var tracker = new IdleSessionTracker();
                         tracker.Start(new[] { new IdleGame(10, "Game", 4, 1) }, IdleMode.Single, new[] { 20, 30, 40 });
                         tracker.Observe(new[] { new IdleGame(10, "Game", 2, 2) });
@@ -106,6 +114,7 @@ namespace IdleMasterExtended.Tests
                         Field<System.Windows.Forms.Timer>(form, "displayTimer").Dispose();
                         Field<SteamSessionService>(form, "session").CloseAsync().GetAwaiter().GetResult();
                         Field<System.Net.Http.HttpClient>(form, "artworkClient").Dispose();
+                        Field<SteamActivityMonitor>(form, "steamActivity").Dispose();
                         Field<CancellationTokenSource>(form, "lifetime").Cancel();
                     }
                     if (percent == 100 || percent == 200)
@@ -142,7 +151,7 @@ namespace IdleMasterExtended.Tests
                 new[] { "Synthetic scaling render only; actual display DPI and Steam sign-in/idling are unverified." }
                 .Concat(issues.Count == 0 ? new[] { "PASS: controls and long failure status fit all 8 variants." } : issues.ToArray()));
             foreach (var issue in issues) Console.WriteLine("LAYOUT: " + issue);
-            Console.WriteLine("Rendered 28 invisible-window PNGs under " + output);
+            Console.WriteLine("Rendered 60 invisible-window PNGs under " + output);
             Test.Assert(issues.Count == 0, "Desktop layout issues were found; see artifacts/ui-render-report.txt.");
         }
 

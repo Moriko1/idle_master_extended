@@ -313,4 +313,12 @@ Games remaining at last check: {4}</value></data>
   <data name="private_games_skipped" xml:space="preserve"><value>Private games skipped: {0}</value></data>
   <data name="private_skipped_short" xml:space="preserve"><value>{0} private skipped</value></data>
   <data name="private_skipped" xml:space="preserve"><value>private, skipped</value></data>
+  <data name="gaming_warmup" xml:space="preserve"><value>Steam game active. Warming games only up to two hours; card idling returns when your game closes.</value></data>
+  <data name="gaming_waiting" xml:space="preserve"><value>Steam game active. Warm-up finished; waiting for your game to close before card idling.</value></data>
+  <data name="notification_paused" xml:space="preserve"><value>Idle Master paused</value></data>
+  <data name="notification_completed" xml:space="preserve"><value>Card queue completed</value></data>
+  <data name="notification_completed_body" xml:space="preserve"><value>No eligible card drops remain. Your session summary is ready in Idle Master.</value></data>
+  <data name="steam_account_mismatch" xml:space="preserve"><value>Steam client account differs from sign-in</value></data>
+  <data name="steam_account_changed_pause" xml:space="preserve"><value>Steam account changed. Helpers stopped. Switch account or return to the signed-in account, then Resume.</value></data>
+  <data name="steam_closed_pause" xml:space="preserve"><value>Steam closed. Helpers stopped and the queue was kept. Open Steam, then press Resume.</value></data>
 </root>

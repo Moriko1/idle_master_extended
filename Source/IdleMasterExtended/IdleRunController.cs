@@ -9,6 +9,12 @@ namespace IdleMasterExtended
     public enum IdleMode { Single, OneThenMany, ManyThenOne, Fast, Whitelist }
     public enum IdleRunState { Stopped, Starting, Running, Paused, Completed, Faulted }
 
+    /// <summary>Optional elapsed clock: preparation budgets must not follow wall-clock corrections.</summary>
+    public interface IMonotonicIdleClock
+    {
+        TimeSpan Elapsed { get; }
+    }
+
     /// <summary>Classifies a scan failure without discarding the previous verified game queue.</summary>
     public sealed class IdleRefreshException : Exception
     {
@@ -51,10 +57,11 @@ namespace IdleMasterExtended
         public DateTimeOffset? NextCheckAt { get; private set; }
         public string Error { get; private set; }
         public SteamReadStatus? ReadFailure { get; private set; }
+        public bool GameplayActive { get; private set; }
 
         internal IdleRunStatus(IdleRunState state, IdleMode mode, IEnumerable<IdleGame> active,
             IEnumerable<IdleGame> remaining, DateTimeOffset? nextCheckAt, string error,
-            SteamReadStatus? readFailure = null)
+            SteamReadStatus? readFailure = null, bool gameplayActive = false)
         {
             State = state;
             Mode = mode;
@@ -63,6 +70,7 @@ namespace IdleMasterExtended
             NextCheckAt = nextCheckAt;
             Error = error;
             ReadFailure = readFailure;
+            GameplayActive = gameplayActive;
         }
     }
 
@@ -76,6 +84,11 @@ namespace IdleMasterExtended
         private readonly object sync = new object();
         private readonly List<IIdleHelper> helpers = new List<IIdleHelper>();
         private readonly HashSet<int> skipped = new HashSet<int>();
+        private readonly Dictionary<int, WarmupTime> warmupTimes = new Dictionary<int, WarmupTime>();
+        private HashSet<int> playingAppIds = new HashSet<int>();
+        private bool gameplayActive;
+        private long activityRevision;
+        private TaskCompletionSource<bool> activityChanged = NewActivitySignal();
         private HashSet<int> privateGames = new HashSet<int>();
         private readonly Dictionary<int, CancellationTokenSource> pendingLaunches =
             new Dictionary<int, CancellationTokenSource>();
@@ -121,7 +134,9 @@ namespace IdleMasterExtended
                     mode = idleMode;
                     expectedSteamId = steamId;
                     if (!keepSkipped) skipped.Clear();
+                    if (!keepSkipped) warmupTimes.Clear();
                     games = FilterGames(supplied);
+                    UpdateWarmupBaselines(games);
                     privateRefreshPending = false;
                 }
                 BeginRun();
@@ -145,12 +160,12 @@ namespace IdleMasterExtended
                 var excluded = games.RemoveAll(game => privateGames.Contains(game.AppId));
                 active.RemoveAll(game => privateGames.Contains(game.AppId));
                 removed = helpers.Where(helper => privateGames.Contains(helper.AppId)).ToList();
-                foreach (var helper in removed) helpers.Remove(helper);
+                foreach (var helper in removed) { helpers.Remove(helper); FinishWarmupTime(helper.AppId); }
                 launches = pendingLaunches.Where(item => privateGames.Contains(item.Key)).Select(item => item.Value).ToList();
                 if (excluded > 0 && (snapshot.State == IdleRunState.Starting || snapshot.State == IdleRunState.Running))
                     privateRefreshPending = true;
                 updated = new IdleRunStatus(snapshot.State, mode, active, games,
-                    snapshot.NextCheckAt, snapshot.Error, snapshot.ReadFailure);
+                    snapshot.NextCheckAt, snapshot.Error, snapshot.ReadFailure, gameplayActive);
                 snapshot = updated;
             }
             foreach (var launch in launches)
@@ -166,7 +181,51 @@ namespace IdleMasterExtended
             NotifyChanged(updated);
         }
 
-        public async Task PauseAsync()
+        /// <summary>Changes preparation policy without pausing or discarding the verified card queue.</summary>
+        public void UpdateGameActivity(IEnumerable<int> actualAppIds, bool isGameplayActive)
+        {
+            if (actualAppIds == null) throw new ArgumentNullException(nameof(actualAppIds));
+            var appIds = new HashSet<int>(actualAppIds);
+            if (appIds.Any(appId => appId <= 0)) throw new ArgumentOutOfRangeException(nameof(actualAppIds));
+            List<IIdleHelper> removed;
+            List<CancellationTokenSource> launches;
+            IdleRunStatus updated;
+            lock (sync)
+            {
+                if (disposed || (gameplayActive == isGameplayActive && playingAppIds.SetEquals(appIds))) return;
+                gameplayActive = isGameplayActive;
+                playingAppIds = appIds;
+                activityRevision++;
+                var previousSignal = activityChanged;
+                activityChanged = NewActivitySignal();
+                previousSignal.TrySetResult(true);
+                removed = gameplayActive ? helpers.Where(helper => !CanPrepareDuringGameplay(
+                    games.FirstOrDefault(game => game.AppId == helper.AppId))).ToList() : new List<IIdleHelper>();
+                foreach (var helper in removed)
+                {
+                    helpers.Remove(helper);
+                    FinishWarmupTime(helper.AppId);
+                }
+                active.RemoveAll(game => removed.Any(helper => helper.AppId == game.AppId));
+                launches = pendingLaunches.Values.ToList();
+                updated = new IdleRunStatus(snapshot.State, mode, active, games,
+                    snapshot.NextCheckAt, snapshot.Error, snapshot.ReadFailure, gameplayActive);
+                snapshot = updated;
+            }
+            foreach (var launch in launches)
+            {
+                try { launch.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }
+            foreach (var helper in removed)
+            {
+                try { helper.Dispose(); }
+                catch { }
+            }
+            NotifyChanged(updated);
+        }
+
+        public async Task PauseAsync(string reason = null)
         {
             await commands.WaitAsync().ConfigureAwait(false);
             try
@@ -174,7 +233,7 @@ namespace IdleMasterExtended
                 ThrowIfDisposed();
                 if (Snapshot.State != IdleRunState.Running && Snapshot.State != IdleRunState.Starting) return;
                 await CancelRunAsync().ConfigureAwait(false);
-                Publish(IdleRunState.Paused);
+                Publish(IdleRunState.Paused, null, reason);
             }
             finally { commands.Release(); }
         }
@@ -256,52 +315,88 @@ namespace IdleMasterExtended
             string error = null;
             SteamReadStatus? readFailure = null;
             var finished = false;
+            var helperFailures = 0;
+            var initializationFailures = 0;
             try
             {
                 while (true)
                 {
-                    token.ThrowIfCancellationRequested();
-                    List<IdleGame> remaining;
-                    lock (sync) remaining = games.ToList();
-                    if (remaining.Count == 0)
+                    try
                     {
-                        bool needsRefresh;
-                        lock (sync) needsRefresh = privateRefreshPending;
-                        if (needsRefresh) { await RefreshAsync(token).ConfigureAwait(false); continue; }
-                        finished = true;
-                        break;
-                    }
-
-                    if (mode == IdleMode.Fast && remaining.Count > 1)
-                    {
-                        var batch = remaining.Take(MaximumHelpers).ToList();
-                        await StartHelpersAsync(batch, token).ConfigureAwait(false);
-                        await WaitAsync(TimeSpan.FromMinutes(5), token).ConfigureAwait(false);
-                        await RefreshAsync(token).ConfigureAwait(false);
-                        StopHelpers();
-                        await WaitAsync(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
-                        foreach (var candidate in batch)
+                        token.ThrowIfCancellationRequested();
+                        List<IdleGame> remaining;
+                        bool playing;
+                        long revision;
+                        lock (sync) { remaining = games.ToList(); playing = gameplayActive; revision = activityRevision; }
+                        if (remaining.Count == 0)
                         {
-                            token.ThrowIfCancellationRequested();
-                            IdleGame game;
-                            lock (sync) game = games.FirstOrDefault(item => item.AppId == candidate.AppId);
-                            if (game == null) continue;
-                            await StartHelpersAsync(new[] { game }, token).ConfigureAwait(false);
-                            await WaitAsync(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
-                            StopHelpers();
+                            bool needsRefresh;
+                            lock (sync) needsRefresh = privateRefreshPending;
+                            if (needsRefresh) { await RefreshAsync(token, revision).ConfigureAwait(false); continue; }
+                            finished = true;
+                            break;
                         }
+
+                        if (playing)
+                        {
+                            List<IdleGame> preparation;
+                            lock (sync) preparation = remaining.Where(CanPrepareDuringGameplay).Take(MaximumHelpers).ToList();
+                            await StartHelpersAsync(preparation, token, revision).ConfigureAwait(false);
+                            if (HasWaitingPreparation()) continue;
+                            // A positive card queue may legitimately have no helpers while
+                            // the user plays. Only a complete scan can finish that queue.
+                            await WaitAsync(TimeSpan.FromMinutes(6), token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                        }
+                        else if (mode == IdleMode.Fast && remaining.Count > 1)
+                        {
+                            var batch = remaining.Take(MaximumHelpers).ToList();
+                            await StartHelpersAsync(batch, token, revision).ConfigureAwait(false);
+                            await WaitAsync(TimeSpan.FromMinutes(5), token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                            StopHelpers();
+                            await WaitAsync(TimeSpan.FromSeconds(5), token, revision).ConfigureAwait(false);
+                            foreach (var candidate in batch)
+                            {
+                                token.ThrowIfCancellationRequested();
+                                ThrowIfActivityChanged(revision);
+                                IdleGame game;
+                                lock (sync) game = games.FirstOrDefault(item => item.AppId == candidate.AppId);
+                                if (game == null) continue;
+                                await StartHelpersAsync(new[] { game }, token, revision).ConfigureAwait(false);
+                                await WaitAsync(TimeSpan.FromSeconds(5), token, revision).ConfigureAwait(false);
+                                StopHelpers();
+                            }
+                        }
+                        else
+                        {
+                            var selected = SelectGames(remaining);
+                            await StartHelpersAsync(selected, token, revision).ConfigureAwait(false);
+                            var duration = mode == IdleMode.Whitelist || selected.Count > 1
+                                ? TimeSpan.FromMinutes(6)
+                                : TimeSpan.FromMinutes(selected[0].RemainingCards == 1 ? 5 : 15);
+                            await WaitAsync(duration, token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                        }
+                        helperFailures = 0;
+                        initializationFailures = 0;
                     }
-                    else
+                    catch (ActivityPolicyChangedException) { token.ThrowIfCancellationRequested(); }
+                    catch (IdleHelperException ex) when (IsRecoverable(ex))
                     {
-                        var selected = SelectGames(remaining);
-                        await StartHelpersAsync(selected, token).ConfigureAwait(false);
-                        var duration = mode == IdleMode.Whitelist || selected.Count > 1
-                            ? TimeSpan.FromMinutes(6)
-                            : TimeSpan.FromMinutes(selected[0].RemainingCards == 1 ? 5 : 15);
-                        await WaitAsync(duration, token).ConfigureAwait(false);
-                        // Whitelists have no card-completion test, but still need periodic
-                        // account and per-game privacy validation before retaining helpers.
-                        await RefreshAsync(token).ConfigureAwait(false);
+                        StopHelpers();
+                        helperFailures = Math.Min(helperFailures + 1, 5);
+                        initializationFailures = ex.Failure == IdleHelperFailure.InitializationFailed
+                            ? initializationFailures + 1 : 0;
+                        if (initializationFailures >= 6)
+                            throw new IdleHelperException("Steam could not initialize idling after several retries. Check the queued game and Steam, then retry.");
+                        var retry = TimeSpan.FromSeconds(Math.Min(60, 5 * Math.Pow(2, helperFailures - 1)));
+                        try
+                        {
+                            await WaitAsync(retry, token, CurrentActivityRevision(),
+                                "Steam is temporarily unavailable. Retrying idling automatically.").ConfigureAwait(false);
+                        }
+                        catch (ActivityPolicyChangedException) { token.ThrowIfCancellationRequested(); }
                     }
                 }
             }
@@ -326,23 +421,24 @@ namespace IdleMasterExtended
         {
             if (mode == IdleMode.Whitelist) return remaining.Take(MaximumHelpers).ToList();
             if (mode == IdleMode.Single || remaining.Count == 1) return remaining.Take(1).ToList();
-            var young = remaining.Where(game => game.HoursPlayed < 2).Take(MaximumHelpers).ToList();
-            var ready = remaining.FirstOrDefault(game => game.HoursPlayed >= 2);
+            var young = remaining.Where(game => EffectiveHours(game) < 2).Take(MaximumHelpers).ToList();
+            var ready = remaining.FirstOrDefault(game => EffectiveHours(game) >= 2);
             if (mode == IdleMode.OneThenMany && ready != null) return new List<IdleGame> { ready };
             if (young.Count > 1) return young;
             return remaining.Take(1).ToList();
         }
 
-        private async Task StartHelpersAsync(IEnumerable<IdleGame> selectedGames, CancellationToken token)
+        private async Task StartHelpersAsync(IEnumerable<IdleGame> selectedGames, CancellationToken token, long revision)
         {
             List<IdleGame> selected;
             List<IIdleHelper> obsolete;
             lock (sync)
             {
+                ThrowIfActivityChanged(revision);
                 selected = selectedGames.Where(game => !privateGames.Contains(game.AppId)).Take(MaximumHelpers).ToList();
                 var wanted = new HashSet<int>(selected.Select(game => game.AppId));
                 obsolete = helpers.Where(helper => !wanted.Contains(helper.AppId)).ToList();
-                foreach (var helper in obsolete) helpers.Remove(helper);
+                foreach (var helper in obsolete) { helpers.Remove(helper); FinishWarmupTime(helper.AppId); }
                 active = selected.Where(game => helpers.Any(helper => helper.AppId == game.AppId)).ToList();
             }
             foreach (var helper in obsolete) helper.Dispose();
@@ -350,19 +446,24 @@ namespace IdleMasterExtended
             foreach (var game in selected)
             {
                 token.ThrowIfCancellationRequested();
+                ThrowIfActivityChanged(revision);
                 await EnsureHelpersAliveAsync().ConfigureAwait(false);
                 CancellationTokenSource launch;
                 lock (sync)
                 {
+                    ThrowIfActivityChanged(revision);
                     if (privateGames.Contains(game.AppId) || helpers.Any(existing => existing.AppId == game.AppId)) continue;
                     launch = CancellationTokenSource.CreateLinkedTokenSource(token);
                     pendingLaunches[game.AppId] = launch;
+                    StartWarmupTime(game);
                 }
                 Task<IIdleHelper> startup = null;
                 var returned = false;
                 try
                 {
                     startup = factory.StartAsync(game.AppId, expectedSteamId, launch.Token);
+                    await WaitForPhaseAsync(startup, launch.Token, revision,
+                        "An idling helper stopped during preparation startup.").ConfigureAwait(false);
                     var helper = await AwaitCancelableAsync(startup, launch.Token).ConfigureAwait(false);
                     returned = true;
                     if (helper == null) throw new IdleHelperException("The idling helper did not initialize.");
@@ -373,13 +474,16 @@ namespace IdleMasterExtended
                         lock (sync)
                         {
                             token.ThrowIfCancellationRequested();
+                            ThrowIfActivityChanged(revision);
                             if (disposed) throw new OperationCanceledException(token);
                             if (privateGames.Contains(game.AppId)) continue;
+                            if (gameplayActive && !CanPrepareDuringGameplay(game)) continue;
                             if (helper.AppId != game.AppId || helper.SteamId != expectedSteamId)
                                 throw new IdleHelperException("The idling helper is using a different Steam account or game.");
                             Observe(helper.Completion);
                             helpers.Add(helper);
                             active.Add(game);
+                            StartWarmupTime(game);
                             accepted = true;
                         }
                     }
@@ -388,28 +492,40 @@ namespace IdleMasterExtended
                 }
                 catch (OperationCanceledException) when (launch.IsCancellationRequested)
                 {
-                    if (!returned && startup != null) ObserveAndDisposeLateHelper(startup);
                     token.ThrowIfCancellationRequested();
+                    ThrowIfActivityChanged(revision);
+                    lock (sync) if (gameplayActive && !CanPrepareDuringGameplay(game)) continue;
                     lock (sync) if (!privateGames.Contains(game.AppId)) throw;
                 }
                 finally
                 {
-                    lock (sync) pendingLaunches.Remove(game.AppId);
+                    if (!returned && startup != null)
+                    {
+                        launch.Cancel();
+                        ObserveAndDisposeLateHelper(startup);
+                    }
+                    lock (sync)
+                    {
+                        pendingLaunches.Remove(game.AppId);
+                        if (!helpers.Any(helper => helper.AppId == game.AppId)) FinishWarmupTime(game.AppId);
+                    }
                     launch.Dispose();
                 }
             }
+            ThrowIfActivityChanged(revision);
             Publish(IdleRunState.Running);
         }
 
-        private async Task RefreshAsync(CancellationToken token)
+        private async Task RefreshAsync(CancellationToken token, long revision)
         {
             var failures = 0;
             while (true)
             {
                 token.ThrowIfCancellationRequested();
+                ThrowIfActivityChanged(revision);
                 try
                 {
-                    await RefreshOnceAsync(token).ConfigureAwait(false);
+                    await RefreshOnceAsync(token, revision).ConfigureAwait(false);
                     Publish(IdleRunState.Running);
                     return;
                 }
@@ -420,12 +536,12 @@ namespace IdleMasterExtended
                     // helpers alive and retry one scan at a time, up to a five-minute cadence.
                     failures = Math.Min(failures + 1, 5);
                     var delay = TimeSpan.FromSeconds(Math.Min(300, 30 * Math.Pow(2, failures - 1)));
-                    await WaitAsync(delay, token, ex.Message, ex.Status).ConfigureAwait(false);
+                    await WaitAsync(delay, token, revision, ex.Message, ex.Status).ConfigureAwait(false);
                 }
             }
         }
 
-        private async Task RefreshOnceAsync(CancellationToken token)
+        private async Task RefreshOnceAsync(CancellationToken token, long revision)
         {
             using (var phase = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
@@ -433,7 +549,7 @@ namespace IdleMasterExtended
                 Observe(refresh);
                 try
                 {
-                    await WaitForPhaseAsync(refresh, token,
+                    await WaitForPhaseAsync(refresh, token, revision,
                         "An idling helper stopped during the badge check. Check Steam and try again.").ConfigureAwait(false);
                     var refreshed = await AwaitCancelableAsync(refresh, token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
@@ -443,7 +559,9 @@ namespace IdleMasterExtended
                     lock (sync)
                     {
                         token.ThrowIfCancellationRequested();
+                        ThrowIfActivityChanged(revision);
                         games = FilterGames(refreshed);
+                        UpdateWarmupBaselines(games);
                         privateRefreshPending = false;
                     }
                 }
@@ -458,7 +576,7 @@ namespace IdleMasterExtended
                 .GroupBy(game => game.AppId).Select(group => group.First()).ToList();
         }
 
-        private async Task WaitAsync(TimeSpan duration, CancellationToken token, string error = null,
+        private async Task WaitAsync(TimeSpan duration, CancellationToken token, long revision, string error = null,
             SteamReadStatus? readFailure = null)
         {
             token.ThrowIfCancellationRequested();
@@ -468,31 +586,199 @@ namespace IdleMasterExtended
                 var delay = clock.DelayAsync(duration, phase.Token);
                 try
                 {
-                    await WaitForPhaseAsync(delay, token,
-                        "An idling helper stopped unexpectedly. Check Steam and sign in again.").ConfigureAwait(false);
+                    await WaitForPhaseAsync(delay, token, revision,
+                        "An idling helper stopped unexpectedly. Check Steam and sign in again.", true).ConfigureAwait(false);
                     await delay.ConfigureAwait(false);
                 }
                 finally { phase.Cancel(); }
             }
         }
 
-        private async Task WaitForPhaseAsync(Task phase, CancellationToken token, string failure)
+        private async Task WaitForPhaseAsync(Task phase, CancellationToken token, long revision, string failure,
+            bool allowPreparationReselection = false)
         {
             while (true)
             {
                 List<Task> waiting;
-                lock (sync) waiting = helpers.Select(helper => helper.Completion).ToList();
-                waiting.Add(phase);
-                var completed = await AwaitCancelableAsync(Task.WhenAny(waiting), token).ConfigureAwait(false);
-                token.ThrowIfCancellationRequested();
-                if (completed == phase) return;
-                // A verified private exclusion deliberately removes and disposes only
-                // its helper. Rebuild watchers rather than mistaking cleanup for a crash.
-                if (!IsRegisteredCompletion(completed)) continue;
-                try { await completed.ConfigureAwait(false); }
-                catch { if (!IsRegisteredCompletion(completed)) continue; throw; }
-                if (IsRegisteredCompletion(completed)) throw new IdleHelperException(failure);
+                Task policyChanged;
+                TimeSpan? preparationDeadline;
+                lock (sync)
+                {
+                    ThrowIfActivityChanged(revision);
+                    waiting = helpers.Select(helper => helper.Completion).ToList();
+                    policyChanged = activityChanged.Task;
+                    preparationDeadline = NextPreparationDeadline();
+                }
+                if (preparationDeadline.HasValue && preparationDeadline.Value <= TimeSpan.Zero)
+                {
+                    ReleasePreparedHelpers();
+                    continue;
+                }
+                using (var deadlineCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
+                {
+                    var deadline = preparationDeadline.HasValue
+                        ? clock.DelayAsync(preparationDeadline.Value, deadlineCancellation.Token) : null;
+                    waiting.Add(phase);
+                    waiting.Add(policyChanged);
+                    if (deadline != null) waiting.Add(deadline);
+                    try
+                    {
+                        var completed = await AwaitCancelableAsync(Task.WhenAny(waiting), token).ConfigureAwait(false);
+                        token.ThrowIfCancellationRequested();
+                        ThrowIfActivityChanged(revision);
+                        if (completed == deadline)
+                        {
+                            await deadline.ConfigureAwait(false);
+                            ReleasePreparedHelpers();
+                            if (allowPreparationReselection && HasWaitingPreparation())
+                                throw new ActivityPolicyChangedException();
+                            continue;
+                        }
+                        if (completed == phase) return;
+                        // Deliberate exclusions are removed before disposal, so their
+                        // completed tasks cannot be mistaken for helper failures.
+                        if (!IsRegisteredCompletion(completed)) continue;
+                        try { await completed.ConfigureAwait(false); }
+                        catch { if (!IsRegisteredCompletion(completed)) continue; throw; }
+                        if (IsRegisteredCompletion(completed)) throw new IdleHelperException(failure,
+                            IdleHelperFailure.UnexpectedExit);
+                    }
+                    finally { deadlineCancellation.Cancel(); }
+                }
             }
+        }
+
+        private bool CanPrepareDuringGameplay(IdleGame game)
+        {
+            // Whitelist entries do not carry verified card eligibility or playtime.
+            return game != null && mode != IdleMode.Whitelist && game.RemainingCards > 0 &&
+                !playingAppIds.Contains(game.AppId) && EffectiveHours(game) < 2 - 1e-9;
+        }
+
+        private bool HasWaitingPreparation()
+        {
+            lock (sync) return gameplayActive && helpers.Count < MaximumHelpers && games.Any(game =>
+                CanPrepareDuringGameplay(game) && !helpers.Any(helper => helper.AppId == game.AppId));
+        }
+
+        private double EffectiveHours(IdleGame game)
+        {
+            lock (sync)
+            {
+                WarmupTime time;
+                if (!warmupTimes.TryGetValue(game.AppId, out time)) return game.HoursPlayed;
+                var elapsed = time.StartedAt.HasValue
+                    ? Math.Max(0, (SteadyTime - time.StartedAt.Value).TotalHours) : 0;
+                return Math.Max(game.HoursPlayed, time.Hours + elapsed);
+            }
+        }
+
+        private void UpdateWarmupBaselines(IEnumerable<IdleGame> supplied)
+        {
+            foreach (var game in supplied)
+            {
+                WarmupTime time;
+                if (!warmupTimes.TryGetValue(game.AppId, out time))
+                    warmupTimes[game.AppId] = new WarmupTime { Hours = game.HoursPlayed };
+                else
+                {
+                    time.Hours = EffectiveHours(game);
+                    if (time.StartedAt.HasValue) time.StartedAt = SteadyTime;
+                }
+            }
+        }
+
+        private void StartWarmupTime(IdleGame game)
+        {
+            lock (sync)
+            {
+                UpdateWarmupBaselines(new[] { game });
+                warmupTimes[game.AppId].StartedAt = SteadyTime;
+            }
+        }
+
+        private void FinishWarmupTime(int appId)
+        {
+            lock (sync)
+            {
+                WarmupTime time;
+                if (!warmupTimes.TryGetValue(appId, out time) || !time.StartedAt.HasValue) return;
+                time.Hours += Math.Max(0, (SteadyTime - time.StartedAt.Value).TotalHours);
+                time.StartedAt = null;
+            }
+        }
+
+        private TimeSpan? NextPreparationDeadline()
+        {
+            if (!gameplayActive || mode == IdleMode.Whitelist) return null;
+            var preparation = games.Where(game => helpers.Any(helper => helper.AppId == game.AppId) ||
+                pendingLaunches.ContainsKey(game.AppId)).ToList();
+            if (preparation.Count == 0) return null;
+            return TimeSpan.FromMilliseconds(Math.Max(1,
+                preparation.Min(game => (2 - EffectiveHours(game)) * 3600000)));
+        }
+
+        private void ReleasePreparedHelpers()
+        {
+            List<IIdleHelper> removed;
+            List<CancellationTokenSource> launches;
+            lock (sync)
+            {
+                if (!gameplayActive) return;
+                var prepared = new HashSet<int>(games.Where(game => !CanPrepareDuringGameplay(game)).Select(game => game.AppId));
+                removed = helpers.Where(helper => prepared.Contains(helper.AppId)).ToList();
+                foreach (var helper in removed) { helpers.Remove(helper); FinishWarmupTime(helper.AppId); }
+                launches = pendingLaunches.Where(item => prepared.Contains(item.Key)).Select(item => item.Value).ToList();
+                foreach (var appId in pendingLaunches.Keys.Where(prepared.Contains).ToList()) FinishWarmupTime(appId);
+                active.RemoveAll(game => prepared.Contains(game.AppId));
+            }
+            foreach (var launch in launches)
+            {
+                try { launch.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }
+            foreach (var helper in removed)
+            {
+                try { helper.Dispose(); }
+                catch { }
+            }
+            if (removed.Count > 0 || launches.Count > 0)
+                Publish(Snapshot.State, Snapshot.NextCheckAt, Snapshot.Error, Snapshot.ReadFailure);
+        }
+
+        private long CurrentActivityRevision() { lock (sync) return activityRevision; }
+
+        private TimeSpan SteadyTime
+        {
+            get
+            {
+                var monotonic = clock as IMonotonicIdleClock;
+                return monotonic != null ? monotonic.Elapsed : TimeSpan.FromTicks(clock.UtcNow.UtcDateTime.Ticks);
+            }
+        }
+
+        private void ThrowIfActivityChanged(long revision)
+        {
+            lock (sync) if (revision != activityRevision) throw new ActivityPolicyChangedException();
+        }
+
+        private static bool IsRecoverable(IdleHelperException exception)
+        {
+            return exception.Failure == IdleHelperFailure.SteamUnavailable ||
+                exception.Failure == IdleHelperFailure.InitializationFailed ||
+                exception.Failure == IdleHelperFailure.UnexpectedExit;
+        }
+
+        private static TaskCompletionSource<bool> NewActivitySignal()
+        {
+            return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        private sealed class ActivityPolicyChangedException : Exception { }
+        private sealed class WarmupTime
+        {
+            public double Hours;
+            public TimeSpan? StartedAt;
         }
 
         private bool IsRegisteredCompletion(Task completion)
@@ -515,7 +801,8 @@ namespace IdleMasterExtended
                     }
                     catch { if (!IsRegisteredCompletion(helper.Completion)) continue; throw; }
                     if (IsRegisteredCompletion(helper.Completion))
-                        throw new IdleHelperException("An idling helper stopped unexpectedly. Check Steam and sign in again.");
+                        throw new IdleHelperException("An idling helper stopped unexpectedly. Check Steam and try again.",
+                            IdleHelperFailure.UnexpectedExit);
                 }
             }
         }
@@ -526,6 +813,7 @@ namespace IdleMasterExtended
             lock (sync)
             {
                 owned = helpers.ToList();
+                foreach (var helper in owned) FinishWarmupTime(helper.AppId);
                 helpers.Clear();
                 active = new List<IdleGame>();
             }
@@ -542,7 +830,7 @@ namespace IdleMasterExtended
             IdleRunStatus status;
             lock (sync)
             {
-                status = new IdleRunStatus(state, mode, active, games, nextCheck, error, readFailure);
+                status = new IdleRunStatus(state, mode, active, games, nextCheck, error, readFailure, gameplayActive);
                 snapshot = status;
             }
             NotifyChanged(status);

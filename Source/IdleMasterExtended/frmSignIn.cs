@@ -36,7 +36,7 @@ namespace IdleMasterExtended
                 poll.Stop(); lifetime.Cancel();
                 session.Browser.CoreWebView2.NavigationCompleted -= Navigated;
                 session.Browser.Parent = home; session.Browser.Dock = DockStyle.None;
-                session.Browser.Size = new Size(1, 1); session.Browser.Visible = false;
+                session.Browser.Size = new Size(1, 1); session.Browser.Visible = false; session.ReleasePage();
             };
         }
         private async void Navigated(object sender, CoreWebView2NavigationCompletedEventArgs args)

@@ -26,7 +26,9 @@ namespace IdleMasterExtended.Tests
                 Test.Run("Helper Steam connection resilience", HelperConnectionTests.RunAll);
                 Test.Run("Portable preference persistence", SettingsPersistenceTests.RunAll);
                 Test.Run("Empty-queue Start availability", StartAvailabilityTests.RunAll);
-                Console.WriteLine("PASS: all 9 regression suites.");
+                Test.Run("Steam game activity detection", SteamActivityTests.RunAll);
+                Test.Run("Background work and quiet run notifications", DesktopRunPolicyTests.RunAll);
+                Console.WriteLine("PASS: all 11 regression suites.");
                 return 0;
             }
             catch (Exception exception)
