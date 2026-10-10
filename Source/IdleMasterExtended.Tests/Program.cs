@@ -11,7 +11,7 @@ namespace IdleMasterExtended.Tests
             try
             {
                 if (Array.IndexOf(args, "--live-session") >= 0)
-                    return SessionLiveProbe.Run();
+                    return SessionLiveProbe.Run(Array.IndexOf(args, "--identity-only") >= 0);
                 if (Array.IndexOf(args, "--render") >= 0)
                 {
                     DesktopRenderTests.Run();
@@ -21,7 +21,7 @@ namespace IdleMasterExtended.Tests
                 Test.RunAsync("Private game verification and atomic queue filtering", async () => { await PrivateGamesTests.RunAllAsync(); await PrivateQueueTests.RunAllAsync(); });
                 Test.RunAsync("Idle run supervision and cancellation", IdleRunTests.RunAllAsync);
                 Test.Run("Settings save and cancellation", SettingsTests.RunAll);
-                Test.Run("Steam session identity", SessionTests.RunAll);
+                Test.Run("Steam session identity", () => { SessionTests.RunAll(); SteamSessionNavigationTests.RunAll(); });
                 Test.Run("Session summary and nonactivating controls", SessionSummaryTests.RunAll);
                 Test.Run("Helper Steam connection resilience", HelperConnectionTests.RunAll);
                 Test.Run("Portable preference persistence", SettingsPersistenceTests.RunAll);

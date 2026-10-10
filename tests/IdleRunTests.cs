@@ -49,6 +49,9 @@ namespace IdleMasterExtended.Tests
             await RecoverableStartupRetriesAndStopCancelsAsync();
             await PersistentInitializationFailureNeedsRecoveryAsync();
             await TypedAccountMismatchStopsSafelyAsync();
+            await IdenticalActivityObservationsKeepRequestBudgetAsync();
+            await ActivityChangesPreserveScanRetryBudgetAsync();
+            await ActivityChangesPreserveHelperRetryBudgetAsync();
             OwnedJobClosesOnlyItsChild();
         }
 
@@ -377,6 +380,137 @@ namespace IdleMasterExtended.Tests
         private static IdleGame Game(int id, int cards = 2, double hours = 0)
         {
             return new IdleGame(id, "Game " + id, cards, hours);
+        }
+
+        private static async Task IdenticalActivityObservationsKeepRequestBudgetAsync()
+        {
+            foreach (var initialHours in new[] { 0.5, 2.0 })
+            {
+                var factory = new FakeFactory();
+                var clock = new AdvancingClock();
+                var scans = 0;
+                var games = new[] { Game(1, 3, initialHours) };
+                using (var run = new IdleRunController(factory, token =>
+                {
+                    Interlocked.Increment(ref scans);
+                    return Task.FromResult<IReadOnlyList<IdleGame>>(games);
+                }, clock))
+                {
+                    run.UpdateGameActivity(new[] { 99 }, true);
+                    await run.StartAsync(games, SteamId, IdleMode.Fast);
+                    await Until(() => run.Snapshot.State == IdleRunState.Running && clock.PendingCount > 0,
+                        "stable gameplay request budget setup");
+                    for (var tick = 1; tick <= 400; tick++)
+                    {
+                        clock.Advance(TimeSpan.FromSeconds(3));
+                        run.UpdateGameActivity(new[] { 99 }, true);
+                        if (tick % 120 == 0)
+                        {
+                            var expected = tick / 120;
+                            await Until(() => scans == expected && clock.PendingCount > 0,
+                                "six-minute scan budget at tick " + tick);
+                        }
+                    }
+                    Assert(scans == 3 && factory.Attempts == (initialHours < 2 ? 1 : 0),
+                        "Four hundred identical local observations in twenty minutes may make only three scans and cannot relaunch helpers.");
+                    Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Single().RemainingCards == 3,
+                        "A warmed queue without helpers retains cards and the same six-minute scan cadence.");
+                    await run.StopAsync();
+                    Assert(clock.PendingCount == 0 && factory.ActiveCount == 0, "Stop cancels the remaining budgeted work.");
+                }
+            }
+        }
+
+        private static async Task ActivityChangesPreserveScanRetryBudgetAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var scans = 0;
+            var game = Game(1, 3, 2);
+            using (var run = new IdleRunController(factory, token =>
+            {
+                Interlocked.Increment(ref scans);
+                return Task.FromException<IReadOnlyList<IdleGame>>(new IdleRefreshException(
+                    SteamReadStatus.TransientFailure, "Synthetic HTTP 429"));
+            }, clock))
+            {
+                await run.StartAsync(new[] { game }, SteamId, IdleMode.Single);
+                await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 1, "private retry budget setup");
+                run.UpdatePrivateGames(new[] { 1 });
+                clock.AdvanceNext();
+                await Until(() => scans == 1 && clock.PendingCount == 1 &&
+                    run.Snapshot.ReadFailure == SteamReadStatus.TransientFailure, "first private scan retry window");
+                var identity = 100;
+                foreach (var expectedDelay in new[] { 30, 60 })
+                {
+                    var expectedScans = scans;
+                    for (var elapsed = 3; elapsed < expectedDelay; elapsed += 3)
+                    {
+                        clock.Advance(TimeSpan.FromSeconds(3));
+                        run.UpdateGameActivity(new[] { identity++ }, true);
+                        var remaining = TimeSpan.FromSeconds(expectedDelay - elapsed);
+                        await Until(() => clock.PendingCount == 1 && clock.NextDelay == remaining,
+                            "scan backoff retained after changed gameplay observation");
+                        Assert(scans == expectedScans,
+                            "Changed gameplay IDs cannot turn an all-private retry window into repeated HTTP requests.");
+                    }
+                    clock.Advance(TimeSpan.FromSeconds(3));
+                    run.UpdateGameActivity(new[] { identity++ }, true);
+                    await Until(() => scans == expectedScans + 1 && clock.PendingCount == 1,
+                        "scan retry at its original monotonic deadline");
+                }
+                Assert(scans == 3 && clock.NextDelay == TimeSpan.FromSeconds(120) &&
+                    run.Snapshot.State == IdleRunState.Running && game.RemainingCards == 3,
+                    "Interrupted retry invocations preserve failure escalation and cannot claim card completion.");
+                await run.StopAsync();
+                Assert(clock.PendingCount == 0 && factory.ActiveCount == 0, "Stop cancels the retained scan retry window.");
+            }
+        }
+
+        private static async Task ActivityChangesPreserveHelperRetryBudgetAsync()
+        {
+            var factory = new FakeFactory();
+            var clock = new AdvancingClock();
+            var scans = 0;
+            factory.StartOverride = (app, steam, token) => Task.FromException<IIdleHelper>(
+                new IdleHelperException("Synthetic initialization failure", IdleHelperFailure.InitializationFailed));
+            using (var run = new IdleRunController(factory, token =>
+            {
+                Interlocked.Increment(ref scans);
+                return Task.FromResult<IReadOnlyList<IdleGame>>(new[] { Game(1) });
+            }, clock))
+            {
+                run.UpdateGameActivity(new[] { 99 }, true);
+                await run.StartAsync(new[] { Game(1) }, SteamId, IdleMode.Fast);
+                var identity = 100;
+                var retryDelays = new[] { 5, 10, 20, 40, 60 };
+                for (var failure = 1; failure <= retryDelays.Length; failure++)
+                {
+                    var expectedAttempts = failure;
+                    await Until(() => factory.Attempts == expectedAttempts && clock.PendingCount == 1,
+                        "helper retry budget " + failure);
+                    var remainingSeconds = retryDelays[failure - 1];
+                    Assert(clock.NextDelay == TimeSpan.FromSeconds(remainingSeconds), "Helper retries retain their escalating delay.");
+                    while (remainingSeconds > 3)
+                    {
+                        clock.Advance(TimeSpan.FromSeconds(3));
+                        remainingSeconds -= 3;
+                        run.UpdateGameActivity(new[] { identity++ }, true);
+                        var remaining = TimeSpan.FromSeconds(remainingSeconds);
+                        await Until(() => clock.PendingCount == 1 && clock.NextDelay == remaining,
+                            "helper deadline retained after gameplay change");
+                        Assert(factory.Attempts == expectedAttempts,
+                            "Gameplay changes cannot bypass the helper initialization backoff.");
+                    }
+                    clock.Advance(TimeSpan.FromSeconds(remainingSeconds));
+                    run.UpdateGameActivity(new[] { identity++ }, true);
+                }
+                await Until(() => factory.Attempts == 6 && run.Snapshot.State == IdleRunState.Faulted,
+                    "persistent initialization failure after interrupted retry windows");
+                Assert(scans == 0 && factory.ActiveCount == 0 && clock.PendingCount == 0 &&
+                    run.Snapshot.RemainingGames.Single().RemainingCards == 2,
+                    "Activity changes cannot reset initialization failure limits, consume HTTP budget, or discard counts.");
+            }
         }
 
         private static async Task PrioritizesReadyThenManyAsync()
@@ -1080,11 +1214,13 @@ namespace IdleMasterExtended.Tests
             if (!condition) throw new InvalidOperationException(message);
         }
 
-        private sealed class FakeClock : IIdleClock
+        private sealed class FakeClock : IIdleClock, IMonotonicIdleClock
         {
             private readonly object sync = new object();
             private readonly List<Delay> delays = new List<Delay>();
+            private TimeSpan elapsed;
             public DateTimeOffset UtcNow { get { return new DateTimeOffset(2026, 10, 9, 0, 0, 0, TimeSpan.Zero); } }
+            public TimeSpan Elapsed { get { lock (sync) return elapsed; } }
             public int PendingCount { get { lock (sync) return delays.Count(delay => !delay.Source.Task.IsCompleted); } }
             public TimeSpan NextDelay { get { lock (sync) return delays.First(delay => !delay.Source.Task.IsCompleted).Duration; } }
 
@@ -1099,7 +1235,12 @@ namespace IdleMasterExtended.Tests
 
             public void ReleaseNext()
             {
-                lock (sync) delays.First(delay => !delay.Source.Task.IsCompleted).Source.TrySetResult(true);
+                lock (sync)
+                {
+                    var delay = delays.First(item => !item.Source.Task.IsCompleted);
+                    elapsed += delay.Duration;
+                    delay.Source.TrySetResult(true);
+                }
             }
 
             private sealed class Delay
@@ -1119,6 +1260,8 @@ namespace IdleMasterExtended.Tests
             public TimeSpan Elapsed
             { get { lock (sync) return now - new DateTimeOffset(2026, 10, 10, 0, 0, 0, TimeSpan.Zero); } }
             public int PendingCount { get { lock (sync) return delays.Count(delay => !delay.Source.Task.IsCompleted); } }
+            public TimeSpan NextDelay
+            { get { lock (sync) return delays.Where(delay => !delay.Source.Task.IsCompleted).Min(delay => delay.Due) - now; } }
 
             public Task DelayAsync(TimeSpan duration, CancellationToken token)
             {
@@ -1144,6 +1287,16 @@ namespace IdleMasterExtended.Tests
             }
 
             public void ShiftWallClock(TimeSpan adjustment) { lock (sync) wallOffset += adjustment; }
+
+            public void Advance(TimeSpan duration)
+            {
+                lock (sync)
+                {
+                    now = now.Add(duration);
+                    foreach (var delay in delays.Where(delay => !delay.Source.Task.IsCompleted && delay.Due <= now))
+                        delay.Source.TrySetResult(true);
+                }
+            }
 
             private sealed class Delay
             {

@@ -80,6 +80,12 @@ namespace IdleMasterExtended.Tests
                     fixture.Set("busy", false);
                     fixture.Set("authenticated", false);
                     fixture.AssertEnabled(false, "An expired login cannot start from preserved counts.");
+                    fixture.Set("lastFailure", SteamReadStatus.LoginRequired);
+                    fixture.AssertAccountRecovery(true, "A retained mismatched account still offers explicit Switch account.");
+                    fixture.SetCurrent(null);
+                    fixture.AssertAccountRecovery(false, "An absent account uses ordinary Sign in.");
+                    fixture.SetCurrent(new SteamSession(76561198000000001, "Synthetic account"));
+                    fixture.Set("lastFailure", null);
                     fixture.Set("authenticated", true);
                     fixture.SetCurrent(null);
                     fixture.AssertEnabled(false, "Authentication flags alone cannot start without a verified account.");
@@ -156,6 +162,15 @@ namespace IdleMasterExtended.Tests
                 typeof(frmMain).GetMethod("UpdateButtons", BindingFlags.Instance | BindingFlags.NonPublic)
                     .Invoke(form, null);
                 Test.Assert(Field<Button>("btnStart").Enabled == expected, message);
+            }
+
+            internal void AssertAccountRecovery(bool expected, string message)
+            {
+                typeof(frmMain).GetMethod("UpdateButtons", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, null);
+                // Read the control's local Visible flag without showing its parent or firing startup.
+                var visible = (bool)typeof(Control).GetMethod("GetState", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Invoke(Field<Control>("switchAccount"), new object[] { 2 });
+                Test.Assert(visible == expected, message);
             }
 
             private T Field<T>(string name)

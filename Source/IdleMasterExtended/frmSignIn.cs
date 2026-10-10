@@ -14,6 +14,9 @@ namespace IdleMasterExtended
         private readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer { Interval = 3000 };
         private readonly CancellationTokenSource lifetime = new CancellationTokenSource();
         private bool checking;
+        private string checkedCookie;
+        private readonly System.Diagnostics.Stopwatch elapsed = System.Diagnostics.Stopwatch.StartNew();
+        private TimeSpan nextCheck;
         public SteamSession SignedIn { get; private set; }
         public frmSignIn(SteamSessionService session)
         {
@@ -51,7 +54,18 @@ namespace IdleMasterExtended
             checking = true;
             try
             {
-                var result = await session.ValidateAsync(lifetime.Token);
+                // Poll cookie changes locally; never query /my every three seconds while
+                // Steam is waiting for a password, Guard challenge, or QR confirmation.
+                var cookies = await session.Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
+                if (lifetime.IsCancellationRequested) return;
+                var login = System.Linq.Enumerable.FirstOrDefault(cookies,
+                    c => c.Name == "steamLoginSecure" && SteamSessionService.IsCommunityCookie(c.Name, c.Domain));
+                if (login == null || !SteamSessionService.TryReadCookieIdentity(login.Value, out var ignored) ||
+                    elapsed.Elapsed < nextCheck || checkedCookie == login.Value) return;
+                checkedCookie = login.Value; nextCheck = elapsed.Elapsed + TimeSpan.FromSeconds(15);
+                var result = await session.ValidateAsync(lifetime.Token, restoreRemembered: false);
+                if (result.Status == SteamReadStatus.TransientFailure || result.Status == SteamReadStatus.MalformedPage)
+                    checkedCookie = null; // Retry after the local gate and shared HTTP cooldown.
                 if (lifetime.IsCancellationRequested) return;
                 if (result.IsSuccess) { SignedIn = result.Value; DialogResult = DialogResult.OK; Close(); }
                 else if (result.Status == SteamReadStatus.TransientFailure || result.Status == SteamReadStatus.MalformedPage) status.Text = result.Message;

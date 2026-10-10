@@ -16,19 +16,20 @@ namespace IdleMasterExtended
         private readonly HttpClient client;
         private readonly TimeSpan timeout;
         private readonly int maxRetries;
+        public SteamRequestBudget RequestBudget { get; }
 
-        public SteamHttpClient(CookieContainer cookies, TimeSpan? timeout = null, int maxRetries = 2)
+        public SteamHttpClient(CookieContainer cookies, TimeSpan? timeout = null, int maxRetries = 0, SteamRequestBudget requestBudget = null)
             : this(new HttpClientHandler
             {
                 CookieContainer = cookies ?? throw new ArgumentNullException(nameof(cookies)),
                 UseCookies = true,
                 AllowAutoRedirect = false,
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-            }, timeout, maxRetries)
+            }, timeout, maxRetries, requestBudget)
         { }
 
         // An explicit transport supports tests without a live Steam account.
-        public SteamHttpClient(HttpMessageHandler handler, TimeSpan? timeout = null, int maxRetries = 2)
+        public SteamHttpClient(HttpMessageHandler handler, TimeSpan? timeout = null, int maxRetries = 0, SteamRequestBudget requestBudget = null)
         {
             this.timeout = timeout ?? TimeSpan.FromSeconds(15);
             if (this.timeout <= TimeSpan.Zero || this.timeout > TimeSpan.FromMinutes(1))
@@ -36,6 +37,7 @@ namespace IdleMasterExtended
             if (maxRetries < 0 || maxRetries > 3)
                 throw new ArgumentOutOfRangeException(nameof(maxRetries));
             this.maxRetries = maxRetries;
+            RequestBudget = requestBudget ?? SteamRequestBudget.Shared;
             client = new HttpClient(handler ?? throw new ArgumentNullException(nameof(handler)), true);
             client.Timeout = Timeout.InfiniteTimeSpan;
             client.MaxResponseContentBufferSize = DefaultResponseLimit;
@@ -61,70 +63,79 @@ namespace IdleMasterExtended
             for (var attempt = 0; attempt <= maxRetries; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                using (var attemptCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                var retryable = true;
+                try
                 {
-                    attemptCancellation.CancelAfter(timeout);
-                    try
-                    {
-                        result = await ReadAsync(uri, maximumResponseBytes, attemptCancellation.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam took too long to respond. Try again shortly.");
-                    }
-                    catch (HttpRequestException)
-                    {
-                        result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam could not be reached. Check your connection and try again.");
-                    }
-                    catch (IOException)
-                    {
-                        result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam's response was interrupted. Try again shortly.");
-                    }
+                    result = await ReadAsync(uri, maximumResponseBytes, cancellationToken,
+                        status => { if (status == 403 || status == 429) retryable = false; }).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    RequestBudget.Report(SteamRequestSurface.Community, SteamRequestFailure.TimedOut);
+                    result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam took too long to respond. Try again shortly.");
+                }
+                catch (HttpRequestException)
+                {
+                    RequestBudget.Report(SteamRequestSurface.Community, SteamRequestFailure.NetworkUnavailable);
+                    result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam could not be reached. Check your connection and try again.");
+                }
+                catch (IOException)
+                {
+                    RequestBudget.Report(SteamRequestSurface.Community, SteamRequestFailure.Interrupted);
+                    result = SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam's response was interrupted. Try again shortly.");
                 }
                 cancellationToken.ThrowIfCancellationRequested();
-                if (result.Status != SteamReadStatus.TransientFailure || attempt == maxRetries)
+                if (!retryable || result.Status != SteamReadStatus.TransientFailure || attempt == maxRetries)
                     return result;
-                await Task.Delay(TimeSpan.FromMilliseconds(500 * (attempt + 1)), cancellationToken).ConfigureAwait(false);
             }
             return result;
         }
 
-        private async Task<SteamReadResult<string>> ReadAsync(Uri uri, int maximumResponseBytes, CancellationToken cancellationToken)
+        private async Task<SteamReadResult<string>> ReadAsync(Uri uri, int maximumResponseBytes, CancellationToken cancellationToken, Action<int> observeStatus)
         {
             var current = uri;
             for (var redirects = 0; redirects <= 5; redirects++)
             {
-                using (var request = new HttpRequestMessage(HttpMethod.Get, current))
-                using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
-                using (var cancelResponse = cancellationToken.Register(() => response.Dispose()))
+                // A server cooldown is not a network timeout, and is interruptible by the caller.
+                await RequestBudget.WaitForTurnAsync(cancellationToken).ConfigureAwait(false);
+                using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var status = (int)response.StatusCode;
-                    if (status >= 300 && status <= 399)
+                    deadline.CancelAfter(timeout);
+                    var requestToken = deadline.Token;
+                    using (var request = new HttpRequestMessage(HttpMethod.Get, current))
+                    using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, requestToken).ConfigureAwait(false))
+                    using (var cancelResponse = requestToken.Register(() => response.Dispose()))
                     {
-                        var location = response.Headers.Location;
-                        if (location == null)
-                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam returned an incomplete redirect.");
-                        Uri next;
-                        if (!Uri.TryCreate(current, location, out next))
-                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam returned an invalid redirect.");
-                        if (IsLoginUri(next))
+                        requestToken.ThrowIfCancellationRequested();
+                        var status = (int)response.StatusCode;
+                        RequestBudget.ObserveResponse(SteamRequestSurface.Community, response);
+                        observeStatus(status);
+                        if (status >= 300 && status <= 399)
+                        {
+                            var location = response.Headers.Location;
+                            if (location == null)
+                                return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam returned an incomplete redirect.");
+                            Uri next;
+                            if (!Uri.TryCreate(current, location, out next))
+                                return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam returned an invalid redirect.");
+                            if (IsLoginUri(next))
+                                return SteamReadResult<string>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
+                            if (!IsCommunityUri(next))
+                                return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam redirected outside the Community site.");
+                            current = next;
+                            continue;
+                        }
+                        if (status == 401)
                             return SteamReadResult<string>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
-                        if (!IsCommunityUri(next))
-                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam redirected outside the Community site.");
-                        current = next;
-                        continue;
-                    }
-                    if (status == 401)
-                        return SteamReadResult<string>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
-                    if (status == 429 || status == 408 || status >= 500 || status == 403)
-                        return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure,
-                            status == 429 ? "Steam is limiting requests. Wait a little and try again." : "Steam is temporarily unavailable. Try again shortly.");
-                    if (!response.IsSuccessStatusCode)
-                        return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam could not provide the requested page.");
+                        if (status == 429 || status == 408 || status >= 500 || status == 403)
+                            return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure,
+                                status == 429 ? "Steam is limiting requests. Wait a little and try again." : "Steam is temporarily unavailable. Try again shortly.");
+                        if (!response.IsSuccessStatusCode)
+                            return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam could not provide the requested page.");
 
-                    return await ReadContentAsync(response.Content, maximumResponseBytes, cancellationToken).ConfigureAwait(false);
+                        return await ReadContentAsync(response.Content, maximumResponseBytes, requestToken).ConfigureAwait(false);
+                    }
                 }
             }
             return SteamReadResult<string>.Failed(SteamReadStatus.MalformedPage, "Steam redirected too many times.");
@@ -192,10 +203,11 @@ namespace IdleMasterExtended
 
         private static bool IsLoginUri(Uri uri)
         {
-            return string.Equals(uri.Host, "login.steampowered.com", StringComparison.OrdinalIgnoreCase)
+            return uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && string.IsNullOrEmpty(uri.UserInfo)
+                && (string.Equals(uri.Host, "login.steampowered.com", StringComparison.OrdinalIgnoreCase)
                 || (string.Equals(uri.Host, "steamcommunity.com", StringComparison.OrdinalIgnoreCase)
                     && (uri.AbsolutePath.Equals("/login", StringComparison.OrdinalIgnoreCase)
-                        || uri.AbsolutePath.StartsWith("/login/", StringComparison.OrdinalIgnoreCase)));
+                        || uri.AbsolutePath.StartsWith("/login/", StringComparison.OrdinalIgnoreCase))));
         }
 
         public void Dispose()

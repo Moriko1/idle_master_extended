@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using System.IO;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,6 +23,10 @@ namespace IdleMasterExtended.Tests
             await OwnedGamesTests.RunAllAsync();
             await EmptyAndMalformedPagesAreDifferent();
             await HttpFailuresAndRedirectsAreTyped();
+            await RequestBudgetsSurviveClientReplacement();
+            await RetryAfterUsesMonotonicCooldowns();
+            await CanceledWaitDoesNotEraseTheCooldown();
+            await ConcurrentWaitersRespectSpacingAndExtendedCooldowns();
             await ResponseLimitsAndBodyCancellationAreEnforced();
             await CancellationPropagates();
         }
@@ -243,20 +248,31 @@ namespace IdleMasterExtended.Tests
         private static async Task HttpFailuresAndRedirectsAreTyped()
         {
             var handler = new FakeHandler((request, token) => Task.FromResult(Redirect("https://login.steampowered.com/login")));
-            using (var client = new SteamHttpClient(handler, maxRetries: 0))
+            using (var client = new SteamHttpClient(handler, maxRetries: 0, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.LoginRequired && handler.Count == 1, "Login redirect classification failed.");
             }
+            foreach (var address in new[] { "http://login.steampowered.com/login", "https://login.steampowered.com:444/login",
+                "https://user@login.steampowered.com/login", "http://steamcommunity.com/login" })
+            {
+                handler = new FakeHandler((request, token) => Task.FromResult(Redirect(address)));
+                using (var client = new SteamHttpClient(handler, requestBudget: NewBudget()))
+                {
+                    var read = await client.GetAsync(Profile, CancellationToken.None);
+                    Require(read.Status == SteamReadStatus.MalformedPage && handler.Count == 1,
+                        "An unsafe login redirect was treated as evidence of expired login.");
+                }
+            }
             handler = new FakeHandler((request, token) => Task.FromResult(Redirect("https://example.com/")));
-            using (var client = new SteamHttpClient(handler, maxRetries: 0))
+            using (var client = new SteamHttpClient(handler, maxRetries: 0, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.MalformedPage && handler.Count == 1, "An external redirect was followed.");
             }
             handler = new FakeHandler((request, token) => Task.FromResult(request.RequestUri.AbsolutePath.EndsWith("/badges/")
                 ? Ok("page") : Redirect(Profile + "/badges/")));
-            using (var client = new SteamHttpClient(handler, maxRetries: 0))
+            using (var client = new SteamHttpClient(handler, maxRetries: 0, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.IsSuccess && handler.Count == 2, "A same-origin redirect did not resolve.");
@@ -264,13 +280,13 @@ namespace IdleMasterExtended.Tests
             var attempts = 0;
             handler = new FakeHandler((request, token) => Task.FromResult(++attempts == 1
                 ? new HttpResponseMessage((HttpStatusCode)429) : Ok("page")));
-            using (var client = new SteamHttpClient(handler, maxRetries: 1))
+            using (var client = new SteamHttpClient(handler, maxRetries: 1, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
-                Require(read.IsSuccess && handler.Count == 2, "A rate-limit response was not retried within the limit.");
+                Require(read.Status == SteamReadStatus.TransientFailure && read.Value == null && handler.Count == 1, "A rate-limit response was retried immediately or treated as lost login.");
             }
             handler = new FakeHandler((request, token) => { throw new HttpRequestException("Synthetic network failure"); });
-            using (var client = new SteamHttpClient(handler, maxRetries: 1))
+            using (var client = new SteamHttpClient(handler, maxRetries: 1, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.TransientFailure && handler.Count == 2, "Network retries were not bounded.");
@@ -282,11 +298,128 @@ namespace IdleMasterExtended.Tests
                 await Task.Delay(Timeout.Infinite, token);
                 return Ok("unreachable");
             });
-            using (var client = new SteamHttpClient(handler, TimeSpan.FromMilliseconds(30), 0))
+            using (var client = new SteamHttpClient(handler, TimeSpan.FromMilliseconds(30), 0, NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.TransientFailure && handler.Count == 1, "A timeout was not classified.");
             }
+        }
+
+        internal static SteamRequestBudget NewBudget() => new SteamRequestBudget(new FakeSteamRequestClock());
+
+        private static async Task RequestBudgetsSurviveClientReplacement()
+        {
+            var clock = new FakeSteamRequestClock();
+            var records = new List<SteamRequestDiagnostic>();
+            var budget = new SteamRequestBudget(clock, records.Add);
+            var sends = new List<TimeSpan>();
+            var handler = new FakeHandler((request, token) =>
+            {
+                sends.Add(clock.Elapsed);
+                return Task.FromResult(new HttpResponseMessage((HttpStatusCode)429));
+            });
+            using (var first = new SteamHttpClient(handler, maxRetries: 3, requestBudget: budget))
+            {
+                var read = await first.GetAsync(Profile, CancellationToken.None);
+                Require(read.Status == SteamReadStatus.TransientFailure && sends.Count == 1,
+                    "Throttling triggered an internal retry despite an explicit retry allowance.");
+            }
+            handler = new FakeHandler((request, token) => { sends.Add(clock.Elapsed); return Task.FromResult(Ok("page")); });
+            using (var replacement = new SteamHttpClient(handler, requestBudget: budget))
+            {
+                Require((await replacement.GetAsync(Profile, CancellationToken.None)).IsSuccess, "The replacement transport could not recover.");
+                Require((await replacement.GetAsync(Profile, CancellationToken.None)).IsSuccess, "A successive read could not recover.");
+            }
+            Require(sends.SequenceEqual(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(61) }),
+                "Replacing a client erased its cooldown or bypassed one-second send spacing.");
+            Require(records.Count == 1 && records[0].Surface == SteamRequestSurface.Community
+                && records[0].Failure == SteamRequestFailure.RateLimited && records[0].HttpStatus == 429,
+                "HTTP diagnostics did not keep a categorical, credential-free rate-limit record.");
+
+            foreach (var code in new[] { HttpStatusCode.InternalServerError, HttpStatusCode.Forbidden, HttpStatusCode.Unauthorized })
+            {
+                handler = new FakeHandler((request, token) => Task.FromResult(new HttpResponseMessage(code)));
+                using (var client = new SteamHttpClient(handler, requestBudget: NewBudget()))
+                {
+                    var read = await client.GetAsync(Profile, CancellationToken.None);
+                    Require(read.Status == (code == HttpStatusCode.Unauthorized ? SteamReadStatus.LoginRequired : SteamReadStatus.TransientFailure)
+                        && handler.Count == 1 && read.Value == null, "A default transport retried or lost its typed HTTP failure.");
+                }
+            }
+            using (var client = new SteamHttpClient(new FakeHandler((request, token) => Task.FromResult(Ok("page")))))
+                Require(ReferenceEquals(client.RequestBudget, SteamRequestBudget.Shared), "Production clients did not use the process-wide budget.");
+        }
+
+        private static async Task RetryAfterUsesMonotonicCooldowns()
+        {
+            foreach (var kind in new[] { "delta", "date", "missing", "short", "malformed", "forbidden" })
+            {
+                var clock = new FakeSteamRequestClock();
+                var budget = new SteamRequestBudget(clock);
+                await budget.WaitForTurnAsync(CancellationToken.None);
+                using (var response = new HttpResponseMessage(kind == "forbidden" ? HttpStatusCode.Forbidden : (HttpStatusCode)429))
+                {
+                    if (kind == "delta") response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(125));
+                    if (kind == "date") response.Headers.RetryAfter = new RetryConditionHeaderValue(clock.UtcNow.AddSeconds(125));
+                    if (kind == "short") response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(2));
+                    if (kind == "malformed") response.Headers.TryAddWithoutValidation("Retry-After", "not-a-delay");
+                    budget.ObserveResponse(SteamRequestSurface.Community, response);
+                }
+                // Advancing the wall clock cannot prematurely release a monotonic cooldown.
+                clock.UtcNow = clock.UtcNow.AddDays(7);
+                await budget.WaitForTurnAsync(CancellationToken.None);
+                var expected = kind == "delta" || kind == "date" ? 125 : kind == "forbidden" ? 30 : 60;
+                Require(clock.Elapsed == TimeSpan.FromSeconds(expected), "A Retry-After or minimum cooldown was shortened or affected by wall-clock changes.");
+            }
+        }
+
+        private static async Task CanceledWaitDoesNotEraseTheCooldown()
+        {
+            var clock = new FakeSteamRequestClock();
+            var budget = new SteamRequestBudget(clock);
+            await budget.WaitForTurnAsync(CancellationToken.None);
+            using (var response = new HttpResponseMessage((HttpStatusCode)429))
+            {
+                response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(120));
+                budget.ObserveResponse(SteamRequestSurface.Community, response);
+            }
+            using (var cancellation = new CancellationTokenSource())
+            {
+                clock.BeforeDelay = duration => cancellation.Cancel();
+                var canceled = false;
+                try { await budget.WaitForTurnAsync(cancellation.Token); }
+                catch (OperationCanceledException) { canceled = true; }
+                Require(canceled && clock.Elapsed == TimeSpan.Zero, "Cancellation failed to interrupt cooldown spacing.");
+            }
+            clock.BeforeDelay = null;
+            await budget.WaitForTurnAsync(CancellationToken.None);
+            Require(clock.Elapsed == TimeSpan.FromSeconds(120), "Cancellation consumed a future send slot or cleared a server cooldown.");
+
+            var handler = new FakeHandler((request, token) => Task.FromResult(Ok("page")));
+            using (var client = new SteamHttpClient(handler, TimeSpan.FromMilliseconds(30), requestBudget: budget))
+            {
+                using (var response = new HttpResponseMessage((HttpStatusCode)429)) budget.ObserveResponse(SteamRequestSurface.Community, response);
+                Require((await client.GetAsync(Profile, CancellationToken.None)).IsSuccess && handler.Count == 1,
+                    "Waiting for a server cooldown consumed the request timeout before a send.");
+            }
+        }
+
+        private static async Task ConcurrentWaitersRespectSpacingAndExtendedCooldowns()
+        {
+            var clock = new FakeSteamRequestClock { YieldDelays = true };
+            var budget = new SteamRequestBudget(clock);
+            await budget.WaitForTurnAsync(CancellationToken.None);
+            var extended = false;
+            clock.BeforeDelay = duration =>
+            {
+                if (extended) return;
+                extended = true;
+                using (var response = new HttpResponseMessage((HttpStatusCode)429))
+                    budget.ObserveResponse(SteamRequestSurface.Community, response);
+            };
+            await Task.WhenAll(Enumerable.Range(0, 3).Select(index => budget.WaitForTurnAsync(CancellationToken.None)));
+            Require(clock.Elapsed == TimeSpan.FromSeconds(62) && clock.Delays[0] == TimeSpan.FromSeconds(1),
+                "Concurrent sends bypassed an in-flight cooldown extension or shared spacing.");
         }
 
 
@@ -295,7 +428,7 @@ namespace IdleMasterExtended.Tests
             const int size = 9 * 1024 * 1024;
             var handler = new FakeHandler((request, token) => Task.FromResult(
                 new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new TestReadStream(size)) }));
-            using (var client = new SteamHttpClient(handler, maxRetries: 0))
+            using (var client = new SteamHttpClient(handler, maxRetries: 0, requestBudget: NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.MalformedPage,
@@ -306,7 +439,7 @@ namespace IdleMasterExtended.Tests
             }
             handler = new FakeHandler((request, token) => Task.FromResult(
                 new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new TestReadStream(0, true)) }));
-            using (var client = new SteamHttpClient(handler, TimeSpan.FromMilliseconds(30), 0))
+            using (var client = new SteamHttpClient(handler, TimeSpan.FromMilliseconds(30), 0, NewBudget()))
             {
                 var read = await client.GetAsync(Profile, CancellationToken.None);
                 Require(read.Status == SteamReadStatus.TransientFailure, "The attempt timeout did not cancel a response body read.");
@@ -314,7 +447,7 @@ namespace IdleMasterExtended.Tests
             handler = new FakeHandler((request, token) => Task.FromResult(
                 new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new TestReadStream(0, true)) }));
             using (var cancellation = new CancellationTokenSource())
-            using (var client = new SteamHttpClient(handler, TimeSpan.FromSeconds(1), 0))
+            using (var client = new SteamHttpClient(handler, TimeSpan.FromSeconds(1), 0, NewBudget()))
             {
                 cancellation.CancelAfter(30);
                 var canceled = false;
@@ -351,7 +484,7 @@ namespace IdleMasterExtended.Tests
                 return Ok("unreachable");
             });
             using (var cancellation = new CancellationTokenSource())
-            using (var client = new SteamHttpClient(handler, TimeSpan.FromSeconds(1), 0))
+            using (var client = new SteamHttpClient(handler, TimeSpan.FromSeconds(1), 0, NewBudget()))
             {
                 cancellation.CancelAfter(30);
                 var canceled = false;
@@ -458,6 +591,25 @@ namespace IdleMasterExtended.Tests
                 Count++;
                 return respond(request, cancellationToken);
             }
+        }
+    }
+
+    internal sealed class FakeSteamRequestClock : ISteamRequestClock
+    {
+        public TimeSpan Elapsed { get; private set; }
+        public DateTimeOffset UtcNow { get; set; } = new DateTimeOffset(2026, 10, 10, 12, 0, 0, TimeSpan.Zero);
+        public List<TimeSpan> Delays { get; } = new List<TimeSpan>();
+        public Action<TimeSpan> BeforeDelay { get; set; }
+        public bool YieldDelays { get; set; }
+        public async Task DelayAsync(TimeSpan duration, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Delays.Add(duration);
+            BeforeDelay?.Invoke(duration);
+            if (YieldDelays) await Task.Yield();
+            cancellationToken.ThrowIfCancellationRequested();
+            Elapsed += duration;
+            UtcNow += duration;
         }
     }
 }

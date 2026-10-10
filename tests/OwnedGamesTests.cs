@@ -21,7 +21,56 @@ namespace IdleMasterExtended.Tests
             await InclusiveRequestAndFamilyCountsAreVerified();
             await IdentityAndTokenProofIsRequired();
             await IncompleteAndErrorRepliesAreRejected();
+            await ApiFailuresPreserveTheVerifiedSession();
+            await CommunityAndApiReadsShareTheBudget();
             await ApiCancellationPropagates();
+        }
+
+        private static async Task ApiFailuresPreserveTheVerifiedSession()
+        {
+            foreach (var code in new[] { HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden, (HttpStatusCode)429, HttpStatusCode.InternalServerError })
+            {
+                var handler = new ApiHandler((request, token) => Task.FromResult(new HttpResponseMessage(code)));
+                var read = await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler, CommunityReadTests.NewBudget())
+                    .ReadAsync(Profile, CancellationToken.None);
+                Require(read.Status == SteamReadStatus.TransientFailure && read.Value == null && handler.Calls == 1,
+                    "An API token rejection, throttle or outage retried immediately or invalidated verified Community login.");
+            }
+        }
+
+        private static async Task CommunityAndApiReadsShareTheBudget()
+        {
+            var clock = new FakeSteamRequestClock();
+            var budget = new SteamRequestBudget(clock);
+            var sends = new List<TimeSpan>();
+            var communityHandler = new ApiHandler((request, token) =>
+            {
+                sends.Add(clock.Elapsed);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(Page(Proof())) });
+            });
+            var apiCalls = 0;
+            using (var community = new SteamHttpClient(communityHandler, requestBudget: budget))
+            {
+                var reader = new OwnedGamesReader(community, () => new ApiHandler((request, token) =>
+                {
+                    sends.Add(clock.Elapsed);
+                    apiCalls++;
+                    if (apiCalls == 1)
+                    {
+                        var response = new HttpResponseMessage((HttpStatusCode)429);
+                        response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(125));
+                        return Task.FromResult(response);
+                    }
+                    return Task.FromResult(Reply("{\"response\":{\"private_apps\":{}}}"));
+                }));
+                var first = await reader.ReadAsync(Profile, CancellationToken.None);
+                Require(first.Status == SteamReadStatus.TransientFailure && first.Value == null && apiCalls == 1,
+                    "A failed library API read published ownership data or retried internally.");
+                var second = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
+                Require(second.IsSuccess && second.Value.Count == 0, "A later privacy read could not recover using refreshed session proof.");
+            }
+            Require(sends.SequenceEqual(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(126), TimeSpan.FromSeconds(127) }),
+                "Community, owned and private reads failed to share spacing and a longer API Retry-After cooldown.");
         }
 
         private static async Task InclusiveRequestAndFamilyCountsAreVerified()
@@ -42,7 +91,7 @@ namespace IdleMasterExtended.Tests
                     && !input.ContainsKey("appids_filter"), "The owned library was filtered.");
                 return Task.FromResult(Reply("{\"response\":{\"game_count\":2,\"games\":[{\"appid\":10},{\"appid\":20,\"family_shared\":false},{\"appid\":30,\"family_shared\":true}]}}"));
             });
-            var read = await new OwnedGamesReader(community, () => handler).ReadAsync(Profile, CancellationToken.None);
+            var read = await new OwnedGamesReader(community, () => handler, CommunityReadTests.NewBudget()).ReadAsync(Profile, CancellationToken.None);
             Require(read.IsSuccess && read.Value.SetEquals(new[] { 10, 20, 30 }),
                 "The inclusive library or conservative family membership was lost.");
             Require(community.RequestedLimit == SteamHttpClient.MaximumResponseLimit && handler.Calls == 1,
@@ -65,10 +114,10 @@ namespace IdleMasterExtended.Tests
             await RejectProof(root => ChangeLoader(root, 1, loader => loader["bOwnProfile"] = false), SteamReadStatus.LoginRequired);
             await RejectProof(root => ((Dictionary<string, object>)root["Config"])["WEBAPI_BASE_URL"] = "https://example.com/", SteamReadStatus.MalformedPage);
             var handler = new ApiHandler((request, token) => Task.FromResult(Reply("{}")));
-            var read = await new OwnedGamesReader(new FakeCommunity("<html>Unexpected format</html>"), () => handler)
+            var read = await new OwnedGamesReader(new FakeCommunity("<html>Unexpected format</html>"), () => handler, CommunityReadTests.NewBudget())
                 .ReadAsync(Profile, CancellationToken.None);
             Require(read.Status == SteamReadStatus.MalformedPage && handler.Calls == 0, "Unknown HTML was treated as an expired or empty library.");
-            read = await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler)
+            read = await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler, CommunityReadTests.NewBudget())
                 .ReadAsync("https://steamcommunity.com/profiles/00000000000000000", CancellationToken.None);
             Require(read.Status == SteamReadStatus.MalformedPage && handler.Calls == 0, "An all-zero profile ID was accepted.");
         }
@@ -101,7 +150,7 @@ namespace IdleMasterExtended.Tests
                 response.Headers.Location = new Uri("https://example.com/");
                 return Task.FromResult(response);
             });
-            var failed = await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => redirect)
+            var failed = await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => redirect, CommunityReadTests.NewBudget())
                 .ReadAsync(Profile, CancellationToken.None);
             Require(failed.Status == SteamReadStatus.MalformedPage && redirect.Calls == 1,
                 "An API redirect forwarded the ownership token.");
@@ -118,7 +167,7 @@ namespace IdleMasterExtended.Tests
             {
                 cancellation.CancelAfter(30);
                 var canceled = false;
-                try { await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler).ReadAsync(Profile, cancellation.Token); }
+                try { await new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler, CommunityReadTests.NewBudget()).ReadAsync(Profile, cancellation.Token); }
                 catch (OperationCanceledException) { canceled = true; }
                 Require(canceled && handler.Calls == 1, "Ownership cancellation became an empty or failed library.");
             }
@@ -129,14 +178,14 @@ namespace IdleMasterExtended.Tests
             var proof = Proof();
             mutate(proof);
             var handler = new ApiHandler((request, token) => Task.FromResult(Reply("{}")));
-            var read = await new OwnedGamesReader(new FakeCommunity(Page(proof)), () => handler).ReadAsync(Profile, CancellationToken.None);
+            var read = await new OwnedGamesReader(new FakeCommunity(Page(proof)), () => handler, CommunityReadTests.NewBudget()).ReadAsync(Profile, CancellationToken.None);
             Require(read.Status == status && handler.Calls == 0, "Invalid session proof sent an API credential or lost its failure classification.");
         }
 
         private static Task<SteamReadResult<HashSet<int>>> ReadApi(string body, string result = "1")
         {
             var handler = new ApiHandler((request, token) => Task.FromResult(Reply(body, result)));
-            return new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler).ReadAsync(Profile, CancellationToken.None);
+            return new OwnedGamesReader(new FakeCommunity(Page(Proof())), () => handler, CommunityReadTests.NewBudget()).ReadAsync(Profile, CancellationToken.None);
         }
 
         private static Dictionary<string, object> Proof() => new Dictionary<string, object>

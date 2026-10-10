@@ -207,14 +207,12 @@ namespace IdleMasterExtended
         {
             if (string.IsNullOrWhiteSpace(html))
                 return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam returned an empty response. Try again shortly.");
+            if (SteamSessionService.IsChallengePage(document))
+                return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam is limiting requests. Wait a little and try again; your sign-in has been kept.");
             if (document.DocumentNode.SelectSingleNode("//*[@id='login_form' or @id='loginForm' or @id='login_container' or " + ClassToken("loginbox") + "]") != null
                 || Regex.IsMatch(html, @"g_steamID\s*=\s*(?:false|""0""|'0')", RegexOptions.IgnoreCase)
                 || document.DocumentNode.SelectSingleNode("//form[contains(@action,'/login')]") != null)
                 return SteamReadResult<string>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
-            var text = CleanText(document.DocumentNode.InnerText);
-            if (text.IndexOf("too many requests", StringComparison.OrdinalIgnoreCase) >= 0
-                || text.IndexOf("verify you are human", StringComparison.OrdinalIgnoreCase) >= 0)
-                return SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Steam is limiting requests. Wait a little and try again.");
             return null;
         }
 

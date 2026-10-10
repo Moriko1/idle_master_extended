@@ -33,10 +33,12 @@ namespace IdleMasterExtended
         private const string InvalidPrivateList = "Steam's private game list could not be verified. Your previous game list has been kept.";
         private readonly ICommunityClient community;
         private readonly Func<HttpMessageHandler> transportFactory;
+        private readonly SteamRequestBudget requestBudget;
 
-        public OwnedGamesReader(ICommunityClient community, Func<HttpMessageHandler> transportFactory = null)
+        public OwnedGamesReader(ICommunityClient community, Func<HttpMessageHandler> transportFactory = null, SteamRequestBudget requestBudget = null)
         {
             this.community = community ?? throw new ArgumentNullException(nameof(community));
+            this.requestBudget = requestBudget ?? (community as SteamHttpClient)?.RequestBudget ?? SteamRequestBudget.Shared;
             this.transportFactory = transportFactory ?? (() => new HttpClientHandler
             {
                 UseCookies = false,
@@ -95,61 +97,53 @@ namespace IdleMasterExtended
             {
                 client.Timeout = Timeout.InfiniteTimeSpan;
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("IdleMasterExtended/1.12");
-                SteamReadResult<HashSet<int>> result = null;
-                for (var attempt = 0; attempt < 3; attempt++)
+                // Community and API reads share spacing/cooldowns across sessions and scans.
+                // Returning the first transient failure lets the controller schedule recovery.
+                await requestBudget.WaitForTurnAsync(cancellationToken).ConfigureAwait(false);
+                using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                    deadline.CancelAfter(TimeSpan.FromSeconds(15));
+                    try
                     {
-                        deadline.CancelAfter(TimeSpan.FromSeconds(15));
-                        try
+                        using (var request = new HttpRequestMessage(HttpMethod.Get, requestUrl))
+                        using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false))
+                        using (var cancelResponse = deadline.Token.Register(() => response.Dispose()))
                         {
-                            using (var request = new HttpRequestMessage(HttpMethod.Get, requestUrl))
-                            using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false))
-                            using (var cancelResponse = deadline.Token.Register(() => response.Dispose()))
-                            {
-                                deadline.Token.ThrowIfCancellationRequested();
-                                var status = (int)response.StatusCode;
-                                if (status == 401)
-                                    result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam again to continue.");
-                                else if (status == 429 || status == 408 || status >= 500)
-                                    result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " is temporarily unavailable. Try again shortly.");
-                                else if (!response.IsSuccessStatusCode)
-                                    result = Failed(privateGames);
-                                else
-                                {
-                                    IEnumerable<string> results;
-                                    if (!response.Headers.TryGetValues("x-eresult", out results)
-                                        || results.Count() != 1 || results.Single().Trim() != "1")
-                                        result = Failed(privateGames);
-                                    else
-                                    {
-                                        var content = await SteamHttpClient.ReadContentAsync(response.Content, SteamHttpClient.DefaultResponseLimit, deadline.Token).ConfigureAwait(false);
-                                        result = content.IsSuccess ? (privateGames ? ParsePrivateGames(content.Value) : ParseGames(content.Value))
-                                            : SteamReadResult<HashSet<int>>.Failed(content.Status, content.Message);
-                                    }
-                                }
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " took too long to respond. Try again shortly.");
-                        }
-                        catch (HttpRequestException)
-                        {
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " could not be reached. Try again shortly.");
-                        }
-                        catch (IOException)
-                        {
-                            result = SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " was interrupted. Try again shortly.");
+                            deadline.Token.ThrowIfCancellationRequested();
+                            var status = (int)response.StatusCode;
+                            requestBudget.ObserveResponse(SteamRequestSurface.LibraryApi, response);
+                            // This token is shorter lived than the already verified browser session.
+                            // Its rejection is not evidence that remembered Community login expired.
+                            if (status == 401 || status == 403 || status == 429 || status == 408 || status >= 500)
+                                return SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " is temporarily unavailable. Your saved sign-in has been kept. Try again shortly.");
+                            if (!response.IsSuccessStatusCode)
+                                return Failed(privateGames);
+                            IEnumerable<string> results;
+                            if (!response.Headers.TryGetValues("x-eresult", out results)
+                                || results.Count() != 1 || results.Single().Trim() != "1")
+                                return Failed(privateGames);
+                            var content = await SteamHttpClient.ReadContentAsync(response.Content, SteamHttpClient.DefaultResponseLimit, deadline.Token).ConfigureAwait(false);
+                            return content.IsSuccess ? (privateGames ? ParsePrivateGames(content.Value) : ParseGames(content.Value))
+                                : SteamReadResult<HashSet<int>>.Failed(content.Status, content.Message);
                         }
                     }
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (result.Status != SteamReadStatus.TransientFailure || attempt == 2) return result;
-                    await Task.Delay(500 * (attempt + 1), cancellationToken).ConfigureAwait(false);
+                    catch (OperationCanceledException)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        requestBudget.Report(SteamRequestSurface.LibraryApi, SteamRequestFailure.TimedOut);
+                        return SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " took too long to respond. Try again shortly.");
+                    }
+                    catch (HttpRequestException)
+                    {
+                        requestBudget.Report(SteamRequestSurface.LibraryApi, SteamRequestFailure.NetworkUnavailable);
+                        return SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " could not be reached. Try again shortly.");
+                    }
+                    catch (IOException)
+                    {
+                        requestBudget.Report(SteamRequestSurface.LibraryApi, SteamRequestFailure.Interrupted);
+                        return SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " was interrupted. Try again shortly.");
+                    }
                 }
-                return result;
             }
         }
 

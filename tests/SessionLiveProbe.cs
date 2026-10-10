@@ -13,7 +13,7 @@ namespace IdleMasterExtended.Tests
     /// <summary>Opt-in read-only check of the app-owned remembered browser session; never launches idling.</summary>
     internal static class SessionLiveProbe
     {
-        public static int Run()
+        public static int Run(bool identityOnly = false)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -24,7 +24,7 @@ namespace IdleMasterExtended.Tests
                 timer.Tick += async (sender, args) =>
                 {
                     timer.Stop();
-                    try { exit = await ProbeAsync(); }
+                    try { exit = await ProbeAsync(identityOnly); }
                     finally { context.ExitThread(); }
                 };
                 timer.Start();
@@ -33,12 +33,13 @@ namespace IdleMasterExtended.Tests
             return exit;
         }
 
-        private static async Task<int> ProbeAsync()
+        private static async Task<int> ProbeAsync(bool identityOnly)
         {
             SteamReadStatus initialized = SteamReadStatus.TransientFailure;
             SteamReadStatus account = SteamReadStatus.TransientFailure;
             SteamReadStatus badges = SteamReadStatus.TransientFailure;
             bool verified = false;
+            int recoveryAttempts = 0;
             int? games = null, eligible = null, cards = null, privateGames = null;
             string scanMessage = null;
             int exit = 6;
@@ -65,8 +66,9 @@ namespace IdleMasterExtended.Tests
                         var validation = await session.ValidateAsync(cancellation.Token);
                         account = validation.Status;
                         verified = validation.IsSuccess;
-                        exit = 2;
-                        if (verified)
+                        recoveryAttempts = session.RecoveryAttempts;
+                        exit = verified && identityOnly ? 0 : 2;
+                        if (verified && !identityOnly)
                         {
                             var library = new OwnedGamesReader(session.Client);
                             var scan = await new GameQueueScanner(session.Client, library, library)
@@ -98,10 +100,12 @@ namespace IdleMasterExtended.Tests
             }
             var report = string.Join(Environment.NewLine, new[] {
                 "Initialization status: " + initialized,
+                "Identity only: " + identityOnly.ToString().ToLowerInvariant(),
+                "Official browser recovery attempts: " + recoveryAttempts,
                 "Verified private app count: " + (privateGames?.ToString() ?? "unavailable"),
                 "Account status: " + account,
                 "Verified account: " + verified.ToString().ToLowerInvariant(),
-                "Badge scan status: " + badges,
+                "Badge scan status: " + (identityOnly ? "not run" : badges.ToString()),
                 "Badge scan message: " + (scanMessage ?? "unavailable"),
                 "Scanned games: " + Number(games),
                 "Games with drops: " + Number(eligible),
@@ -114,7 +118,7 @@ namespace IdleMasterExtended.Tests
             {
                 var artifacts = Path.Combine(root.FullName, "artifacts");
                 Directory.CreateDirectory(artifacts);
-                File.WriteAllText(Path.Combine(artifacts, "live-session-report.txt"), report + Environment.NewLine);
+                File.WriteAllText(Path.Combine(artifacts, identityOnly ? "live-identity-report.txt" : "live-session-report.txt"), report + Environment.NewLine);
             }
             return exit;
         }

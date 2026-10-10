@@ -48,7 +48,7 @@ def require_x64(path):
 
 def package(version):
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", version):
-        raise RuntimeError("Version must be a semantic version such as 1.12.0-preview.5.")
+        raise RuntimeError("Version must be a semantic version such as 1.12.0-preview.6.")
     changes = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     if changes.strip():
         raise RuntimeError("Commit all changes before packaging so the source archive matches the built binaries.")
@@ -118,7 +118,7 @@ def package(version):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", action="store_true")
-    parser.add_argument("--version", default="1.12.0-preview.5")
+    parser.add_argument("--version", default="1.12.0-preview.6")
     args = parser.parse_args()
     run([msbuild(), ROOT / "Source/IdleMasterExtended.sln", "/restore",
          "/t:Rebuild", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/verbosity:minimal"])

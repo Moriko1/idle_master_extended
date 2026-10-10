@@ -20,9 +20,15 @@ namespace IdleMasterExtended
     internal sealed class SteamSessionService : IDisposable
     {
         private readonly SemaphoreSlim gate = new SemaphoreSlim(1, 1);
+        private readonly System.Diagnostics.Stopwatch elapsed = System.Diagnostics.Stopwatch.StartNew();
+        private readonly SteamSessionRecovery recovery;
+        private TimeSpan? verifiedAt;
+        private string verifiedCookie;
+        public SteamSessionService() { recovery = new SteamSessionRecovery(() => elapsed.Elapsed); }
         public WebView2 Browser { get; private set; }
         public SteamSession Current { get; private set; }
         public SteamHttpClient Client { get; private set; }
+        internal int RecoveryAttempts { get; private set; }
         private bool disposed;
         public bool IsInitialized => !disposed && Browser != null && !Browser.IsDisposed && Browser.CoreWebView2 != null;
         public static bool IsTrustedSteamUri(string value)
@@ -54,43 +60,116 @@ namespace IdleMasterExtended
                 if (IsTrustedSteamUri(e.Uri)) browser.CoreWebView2.Navigate(e.Uri);
             };
         }
-        public async Task<SteamReadResult<SteamSession>> ValidateAsync(CancellationToken token)
+        internal void InvalidateVerification() { verifiedAt = null; verifiedCookie = null; }
+        public async Task<SteamReadResult<SteamSession>> ValidateAsync(CancellationToken token, bool restoreRemembered = true)
         {
             await gate.WaitAsync(token);
             try
             {
                 if (!IsInitialized) return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
-                var browserCookies = await Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
-                token.ThrowIfCancellationRequested();
-                var login = browserCookies.FirstOrDefault(c => c.Name == "steamLoginSecure" && IsCommunityCookie(c.Name, c.Domain));
-                if (login == null || !TryReadCookieIdentity(login.Value, out var expected))
-                    return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
-                var imported = CreateCommunityCookieJar(browserCookies
-                    .Where(c => IsCommunityCookie(c.Name, c.Domain))
-                    .Select(c => new Cookie(c.Name, c.Value, c.Path, c.Domain)
-                    { Secure = c.IsSecure, HttpOnly = c.IsHttpOnly }));
-                if (!imported.IsSuccess)
-                    return SteamReadResult<SteamSession>.Failed(imported.Status, imported.Message);
-                var candidate = new SteamHttpClient(imported.Value);
-                try
+                var pinnedId = Current?.SteamId ?? 0;
+                var accountChanged = false;
+                Func<Task<SteamReadResult<SteamSession>>> read = async () =>
                 {
-                    var response = await candidate.GetAsync("https://steamcommunity.com/my/?l=english", token);
-                    if (!response.IsSuccess) return SteamReadResult<SteamSession>.Failed(response.Status, response.Message);
-                    var identity = ParseIdentity(response.Value, expected);
-                    if (!identity.IsSuccess) return identity;
+                    var cookies = await Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
                     token.ThrowIfCancellationRequested();
-                    Client?.Dispose(); Client = candidate; candidate = null; Current = identity.Value;
-                    return identity;
-                }
-                finally { candidate?.Dispose(); }
+                    var login = cookies.FirstOrDefault(c => c.Name == "steamLoginSecure" && IsCommunityCookie(c.Name, c.Domain));
+                    if (login == null || !TryReadCookieIdentity(login.Value, out var expected))
+                        return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
+                    if (pinnedId == 0) pinnedId = expected;
+                    if (pinnedId != expected)
+                    {
+                        accountChanged = true;
+                        return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Steam account changed. Switch account and scan again.");
+                    }
+                    // Reuse only a recently authenticated, unchanged account. This avoids the
+                    // duplicate /my reads in Start followed immediately by a complete scan.
+                    if (Current != null && Client != null && verifiedCookie == login.Value &&
+                        verifiedAt.HasValue && elapsed.Elapsed - verifiedAt.Value < TimeSpan.FromSeconds(15))
+                        return SteamReadResult<SteamSession>.Succeeded(Current);
+                    var imported = CreateCommunityCookieJar(cookies.Where(c => IsCommunityCookie(c.Name, c.Domain))
+                        .Select(c => new Cookie(c.Name, c.Value, c.Path, c.Domain)
+                        { Secure = c.IsSecure, HttpOnly = c.IsHttpOnly }));
+                    if (!imported.IsSuccess) return SteamReadResult<SteamSession>.Failed(imported.Status, imported.Message);
+                    var candidate = new SteamHttpClient(imported.Value);
+                    try
+                    {
+                        var response = await candidate.GetAsync("https://steamcommunity.com/my/?l=english", token);
+                        if (!response.IsSuccess) return SteamReadResult<SteamSession>.Failed(response.Status, response.Message);
+                        var identity = ParseIdentity(response.Value, expected);
+                        if (!identity.IsSuccess)
+                        {
+                            accountChanged = HasDifferentViewer(response.Value, expected);
+                            return identity;
+                        }
+                        token.ThrowIfCancellationRequested();
+                        Client?.Dispose(); Client = candidate; candidate = null; Current = identity.Value;
+                        verifiedAt = elapsed.Elapsed; verifiedCookie = login.Value;
+                        return identity;
+                    }
+                    finally { candidate?.Dispose(); }
+                };
+                var result = restoreRemembered && !Browser.Visible
+                    ? await recovery.ValidateAsync(read, () => RestoreBrowserSessionAsync(token), () => accountChanged, token)
+                    : await read();
+                if (!result.IsSuccess) { verifiedAt = null; verifiedCookie = null; }
+                return result;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
+                verifiedAt = null; verifiedCookie = null;
                 Logger.Exception(ex, "Steam session validation");
                 return SteamReadResult<SteamSession>.Failed(SteamReadStatus.TransientFailure, "Steam is temporarily unavailable. Retry when connected.");
             }
             finally { gate.Release(); }
+        }
+        private async Task<SteamReadStatus> RestoreBrowserSessionAsync(CancellationToken token)
+        {
+            RecoveryAttempts++;
+            // Steam itself redeems its remembered profile login. No refresh token is extracted,
+            // stored outside WebView2, or exchanged by application code.
+            var completed = new TaskCompletionSource<SteamReadStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var navigation = new SteamSessionNavigation();
+            EventHandler<CoreWebView2NavigationStartingEventArgs> starting = (sender, args) =>
+                navigation.ObserveStarting(args.NavigationId, args.Uri);
+            EventHandler<CoreWebView2NavigationCompletedEventArgs> navigated = (sender, args) =>
+            {
+                navigation.ObserveCompleted(args.NavigationId, args.IsSuccess, args.HttpStatusCode, Browser.CoreWebView2.Source);
+                if (navigation.Result.HasValue) completed.TrySetResult(navigation.Result.Value);
+            };
+            Browser.CoreWebView2.NavigationStarting += starting;
+            Browser.CoreWebView2.NavigationCompleted += navigated;
+            try
+            {
+                using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(token))
+                {
+                    deadline.CancelAfter(TimeSpan.FromSeconds(20));
+                    deadline.Token.ThrowIfCancellationRequested();
+                    Browser.CoreWebView2.Navigate(SteamSessionNavigation.InitialUri);
+                    while (!completed.Task.IsCompleted)
+                    {
+                        await Task.WhenAny(completed.Task, Task.Delay(1000, deadline.Token));
+                        deadline.Token.ThrowIfCancellationRequested();
+                    }
+                    return await completed.Task;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                token.ThrowIfCancellationRequested();
+                return navigation.TimeoutStatus();
+            }
+            finally
+            {
+                if (IsInitialized) { Browser.CoreWebView2.NavigationStarting -= starting; Browser.CoreWebView2.NavigationCompleted -= navigated; }
+                ReleasePage();
+            }
+        }
+        internal static bool HasDifferentViewer(string html, ulong expected)
+        {
+            var match = Regex.Match(html ?? "", @"\bg_steamID\s*=\s*['""](?<id>\d{17})['""]\s*;");
+            return match.Success && ulong.TryParse(match.Groups["id"].Value, out var id) && id != expected;
         }
         internal static bool IsCommunityCookie(string name, string domain)
         {
@@ -123,21 +202,31 @@ namespace IdleMasterExtended
         }
         internal static SteamReadResult<SteamSession> ParseIdentity(string html, ulong expectedSteamId)
         {
+            var document = new HtmlDocument(); document.LoadHtml(html ?? "");
             // This global identifies Steam's authenticated viewer, independently of the profile being viewed.
             var match = Regex.Match(html ?? "", @"\bg_steamID\s*=\s*['""](?<id>\d{17})['""]\s*;");
             if (!match.Success)
             {
+                if (IsChallengePage(document))
+                    return SteamReadResult<SteamSession>.Failed(SteamReadStatus.TransientFailure,
+                        "Steam is limiting requests or checking the connection. Retry shortly; your sign-in has been kept.");
                 if (Regex.IsMatch(html ?? "", @"\bg_steamID\s*=\s*(false|['""](?:0)?['""])\s*;") ||
-                    (html ?? "").IndexOf("login_form", StringComparison.OrdinalIgnoreCase) >= 0)
+                    document.DocumentNode.SelectSingleNode("//*[@id='login_form' or @id='loginForm' or @id='login_container']") != null)
                     return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Steam sign-in expired. Sign in again.");
-                return SteamReadResult<SteamSession>.Failed(SteamReadStatus.MalformedPage, "Steam's account page could not be verified. Retry or sign in again.");
+                return SteamReadResult<SteamSession>.Failed(SteamReadStatus.MalformedPage, "Steam's account page could not be verified. Retry shortly; your sign-in has been kept.");
             }
             if (!ulong.TryParse(match.Groups["id"].Value, out var id) || id != expectedSteamId)
                 return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Steam account changed. Switch account and scan again.");
-            var document = new HtmlDocument(); document.LoadHtml(html);
             var name = document.DocumentNode.SelectSingleNode("//*[@id='account_pulldown']")?.InnerText;
             return SteamReadResult<SteamSession>.Succeeded(new SteamSession(id,
                 string.IsNullOrWhiteSpace(name) ? id.ToString() : WebUtility.HtmlDecode(name).Trim()));
+        }
+        internal static bool IsChallengePage(HtmlDocument document)
+        {
+            var text = WebUtility.HtmlDecode(document.DocumentNode.InnerText ?? "");
+            return text.IndexOf("too many requests", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("verify you are human", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                text.IndexOf("access denied", StringComparison.OrdinalIgnoreCase) >= 0;
         }
         public void ReleasePage()
         {
@@ -151,7 +240,7 @@ namespace IdleMasterExtended
             await gate.WaitAsync();
             try
             {
-                Current = null; Client?.Dispose(); Client = null;
+                Current = null; Client?.Dispose(); Client = null; recovery.Reset(); verifiedAt = null; verifiedCookie = null;
                 if (IsInitialized)
                 {
                     Browser.CoreWebView2.CookieManager.DeleteAllCookies();

@@ -22,7 +22,7 @@ namespace IdleMasterExtended.Tests
             await SameAccountProofIsRequired();
             await UnknownAndMalformedListsAreRejected();
             await ErrorsAndRedirectsKeepTheirClassification();
-            await TransientFailuresRetryWithoutBecomingEmpty();
+            await TransientFailuresDoNotRetryOrBecomeEmpty();
             await CancellationPropagates();
         }
 
@@ -121,12 +121,12 @@ namespace IdleMasterExtended.Tests
                     return Task.FromResult(response);
                 });
                 var read = await Reader(new FakeCommunity(Page(Proof())), handler).ReadPrivateAsync(Profile, CancellationToken.None);
-                Require(read.Status == (code == HttpStatusCode.Unauthorized ? SteamReadStatus.LoginRequired : SteamReadStatus.MalformedPage)
+                Require(read.Status == (code == HttpStatusCode.Found ? SteamReadStatus.MalformedPage : SteamReadStatus.TransientFailure)
                     && read.Value == null && handler.Calls == 1, "A redirect or denied privacy read lost its classification or was followed.");
             }
         }
 
-        private static async Task TransientFailuresRetryWithoutBecomingEmpty()
+        private static async Task TransientFailuresDoNotRetryOrBecomeEmpty()
         {
             var attempts = 0;
             var recovering = new ApiHandler((request, token) =>
@@ -136,8 +136,8 @@ namespace IdleMasterExtended.Tests
                     : Reply("{\"response\":{\"private_apps\":{\"appids\":[10]}}}"));
             });
             var read = await Reader(new FakeCommunity(Page(Proof())), recovering).ReadPrivateAsync(Profile, CancellationToken.None);
-            Require(read.IsSuccess && read.Value.SetEquals(new[] { 10 }) && recovering.Calls == 3,
-                "A rate-limited private-app read did not retry before applying a verified result.");
+            Require(read.Status == SteamReadStatus.TransientFailure && read.Value == null && recovering.Calls == 1,
+                "A rate-limited private-app read was retried immediately or supplied an empty list.");
             foreach (var fail in new Func<Task<HttpResponseMessage>>[]
             {
                 () => Task.FromResult(new HttpResponseMessage((HttpStatusCode)429)),
@@ -147,7 +147,7 @@ namespace IdleMasterExtended.Tests
             {
                 var handler = new ApiHandler((request, token) => fail());
                 read = await Reader(new FakeCommunity(Page(Proof())), handler).ReadPrivateAsync(Profile, CancellationToken.None);
-                Require(read.Status == SteamReadStatus.TransientFailure && read.Value == null && handler.Calls == 3,
+                Require(read.Status == SteamReadStatus.TransientFailure && read.Value == null && handler.Calls == 1,
                     "A failed private-app read discarded known state or became an empty list.");
             }
         }
@@ -170,7 +170,7 @@ namespace IdleMasterExtended.Tests
         }
 
         private static OwnedGamesReader Reader(FakeCommunity community, ApiHandler handler) =>
-            new OwnedGamesReader(community, () => handler);
+            new OwnedGamesReader(community, () => handler, CommunityReadTests.NewBudget());
 
         private static async Task RejectProof(Action<Dictionary<string, object>> mutate, SteamReadStatus status)
         {

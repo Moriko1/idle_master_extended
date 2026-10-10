@@ -23,10 +23,14 @@ Steam handles QR sign-in, passwords, Steam Guard and account challenges. The app
 browser profile and does not store passwords or copied cookies in ordinary settings or logs.
 Your Community login must match the account in the running Steam client.
 **Switch account** and **Sign out** affect this app's session.
+When a Community access cookie expires, Steam's official browser page gets one bounded
+attempt to restore the remembered account before the app asks for sign-in. Recovery still
+requires verified access to the same account; cookies or a successful page load alone do not prove login.
 
 ## Everyday controls
 
 - **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
+- Rate-limit responses honor Steam's retry delay. App HTTP reads share a one-second spacing budget across Community and library checks; rate limits do not cause immediate retries.
 - Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
 - When you launch a Steam game, every mode switches to preparation only: known games below the estimated two-hour threshold can warm up, then their helpers stop. Card idling returns automatically when your game closes. Ready games and whitelist entries with unknown hours wait while you play; the queue stays active. The game you are playing is excluded when its app ID can be detected.
 - Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings; their normal behavior returns outside gameplay.
@@ -43,7 +47,7 @@ Your Community login must match the account in the running Steam client.
 The browser session and diagnostic logs are stored under
 `%LocalAppData%\IdleMasterExtended\Moriko1`.
 Ordinary preferences use `preferences.xml` in that same folder, with atomic saves and a backup; cookies remain in the browser profile. Existing ordinary settings are migrated when available.
-Logs contain operation names and exception types/stacks, not cookies, passwords or page contents.
+Logs contain operation names, categorical request outcomes and exception types/stacks, not URLs, account IDs, cookies, passwords or page contents.
 Upgrading from upstream requires one fresh Steam sign-in; copied-cookie login is retired.
 
 ## Building and verification

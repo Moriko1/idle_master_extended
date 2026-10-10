@@ -317,6 +317,8 @@ namespace IdleMasterExtended
             var finished = false;
             var helperFailures = 0;
             var initializationFailures = 0;
+            var scanRetry = new RetryWindow();
+            var helperRetry = new RetryWindow();
             try
             {
                 while (true)
@@ -328,11 +330,12 @@ namespace IdleMasterExtended
                         bool playing;
                         long revision;
                         lock (sync) { remaining = games.ToList(); playing = gameplayActive; revision = activityRevision; }
+                        await WaitForRetryAsync(helperRetry, token, revision).ConfigureAwait(false);
                         if (remaining.Count == 0)
                         {
                             bool needsRefresh;
                             lock (sync) needsRefresh = privateRefreshPending;
-                            if (needsRefresh) { await RefreshAsync(token, revision).ConfigureAwait(false); continue; }
+                            if (needsRefresh) { await RefreshAsync(token, revision, scanRetry).ConfigureAwait(false); continue; }
                             finished = true;
                             break;
                         }
@@ -346,14 +349,14 @@ namespace IdleMasterExtended
                             // A positive card queue may legitimately have no helpers while
                             // the user plays. Only a complete scan can finish that queue.
                             await WaitAsync(TimeSpan.FromMinutes(6), token, revision).ConfigureAwait(false);
-                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision, scanRetry).ConfigureAwait(false);
                         }
                         else if (mode == IdleMode.Fast && remaining.Count > 1)
                         {
                             var batch = remaining.Take(MaximumHelpers).ToList();
                             await StartHelpersAsync(batch, token, revision).ConfigureAwait(false);
                             await WaitAsync(TimeSpan.FromMinutes(5), token, revision).ConfigureAwait(false);
-                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision, scanRetry).ConfigureAwait(false);
                             StopHelpers();
                             await WaitAsync(TimeSpan.FromSeconds(5), token, revision).ConfigureAwait(false);
                             foreach (var candidate in batch)
@@ -376,7 +379,7 @@ namespace IdleMasterExtended
                                 ? TimeSpan.FromMinutes(6)
                                 : TimeSpan.FromMinutes(selected[0].RemainingCards == 1 ? 5 : 15);
                             await WaitAsync(duration, token, revision).ConfigureAwait(false);
-                            await RefreshAsync(token, revision).ConfigureAwait(false);
+                            await RefreshAsync(token, revision, scanRetry).ConfigureAwait(false);
                         }
                         helperFailures = 0;
                         initializationFailures = 0;
@@ -391,12 +394,8 @@ namespace IdleMasterExtended
                         if (initializationFailures >= 6)
                             throw new IdleHelperException("Steam could not initialize idling after several retries. Check the queued game and Steam, then retry.");
                         var retry = TimeSpan.FromSeconds(Math.Min(60, 5 * Math.Pow(2, helperFailures - 1)));
-                        try
-                        {
-                            await WaitAsync(retry, token, CurrentActivityRevision(),
-                                "Steam is temporarily unavailable. Retrying idling automatically.").ConfigureAwait(false);
-                        }
-                        catch (ActivityPolicyChangedException) { token.ThrowIfCancellationRequested(); }
+                        helperRetry.NextAttemptAt = SteadyTime.Add(retry);
+                        helperRetry.Error = "Steam is temporarily unavailable. Retrying idling automatically.";
                     }
                 }
             }
@@ -516,16 +515,19 @@ namespace IdleMasterExtended
             Publish(IdleRunState.Running);
         }
 
-        private async Task RefreshAsync(CancellationToken token, long revision)
+        private async Task RefreshAsync(CancellationToken token, long revision, RetryWindow retry)
         {
-            var failures = 0;
             while (true)
             {
                 token.ThrowIfCancellationRequested();
                 ThrowIfActivityChanged(revision);
+                await WaitForRetryAsync(retry, token, revision).ConfigureAwait(false);
                 try
                 {
                     await RefreshOnceAsync(token, revision).ConfigureAwait(false);
+                    retry.Failures = 0;
+                    retry.Error = null;
+                    retry.ReadFailure = null;
                     Publish(IdleRunState.Running);
                     return;
                 }
@@ -534,11 +536,27 @@ namespace IdleMasterExtended
                 {
                     // Failed reads never prove that cards have finished. Keep the current
                     // helpers alive and retry one scan at a time, up to a five-minute cadence.
-                    failures = Math.Min(failures + 1, 5);
-                    var delay = TimeSpan.FromSeconds(Math.Min(300, 30 * Math.Pow(2, failures - 1)));
-                    await WaitAsync(delay, token, revision, ex.Message, ex.Status).ConfigureAwait(false);
+                    // The deadline and failure count belong to the run, rather than
+                    // this invocation. Gameplay changes may reselect helpers but may
+                    // never shorten a Steam request backoff or reset its escalation.
+                    retry.Failures = Math.Min(retry.Failures + 1, 5);
+                    var delay = TimeSpan.FromSeconds(Math.Min(300, 30 * Math.Pow(2, retry.Failures - 1)));
+                    retry.NextAttemptAt = SteadyTime.Add(delay);
+                    retry.Error = ex.Message;
+                    retry.ReadFailure = ex.Status;
                 }
             }
+        }
+
+        private async Task WaitForRetryAsync(RetryWindow retry, CancellationToken token, long revision)
+        {
+            if (!retry.NextAttemptAt.HasValue) return;
+            var remaining = retry.NextAttemptAt.Value - SteadyTime;
+            if (remaining > TimeSpan.Zero)
+                await WaitAsync(remaining, token, revision, retry.Error, retry.ReadFailure).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            ThrowIfActivityChanged(revision);
+            retry.NextAttemptAt = null;
         }
 
         private async Task RefreshOnceAsync(CancellationToken token, long revision)
@@ -746,8 +764,6 @@ namespace IdleMasterExtended
                 Publish(Snapshot.State, Snapshot.NextCheckAt, Snapshot.Error, Snapshot.ReadFailure);
         }
 
-        private long CurrentActivityRevision() { lock (sync) return activityRevision; }
-
         private TimeSpan SteadyTime
         {
             get
@@ -775,6 +791,13 @@ namespace IdleMasterExtended
         }
 
         private sealed class ActivityPolicyChangedException : Exception { }
+        private sealed class RetryWindow
+        {
+            public TimeSpan? NextAttemptAt;
+            public int Failures;
+            public string Error;
+            public SteamReadStatus? ReadFailure;
+        }
         private sealed class WarmupTime
         {
             public double Hours;

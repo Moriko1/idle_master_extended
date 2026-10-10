@@ -1,6 +1,20 @@
-# Prerelease validation: 1.12.0-preview.5
+# Prerelease validation: 1.12.0-preview.6
 
 Validation performed on the Windows development host for the corrected Moriko1 prerelease.
+
+## Sign-in and request-budget fixes in preview.6
+
+The reported repeated sign-in request has no matching current diagnostic trace proving its exact cause. Code review found concrete false-expiry paths: the app immediately required sign-in when a Community access cookie was missing/expired, even if Steam's browser profile could still restore a remembered login; a library API token rejection also marked the whole account signed out. Preview.5 added hidden-page unloading but did not delete cookies or change the browser profile path. Whether page unloading contributed to the reported symptom is unconfirmed.
+
+A missing/expired Community session now receives one cancellable, 20-second navigation through Steam's official browser page. Steam handles its own remembered-session renewal; application code does not extract or exchange refresh tokens. The app reimports Community access cookies and requires authenticated viewer identity to match the same account before continuing. Failed restoration uses a two-minute monotonic cooldown; a new successful interactive sign-in is immediately usable during that cooldown. Account changes still require explicit recovery. A mid-scan expiry can restart the complete atomic scan once after verification; partial counts are never published.
+
+Interactive sign-in polls local cookie changes rather than querying the account every three seconds. HTTP verification has a 15-second gate, and an unchanged recently verified account is reused briefly to avoid duplicate Start/scan identity requests. Incomplete/error navigation, malformed pages and rate-limit challenge pages preserve the saved session. WebAPI 401 after verified same-account page access is a transient library-token failure, not proof of expired Community login.
+
+App HTTP reads share one-second send spacing across Community and owned/private-library requests and across replaced session clients. HTTP 429 has at least 60 seconds of cooldown, HTTP 403 at least 30 seconds; longer valid Retry-After delays are honored, including date-form delays converted to monotonic time. Neither response is retried immediately. Waiting remains cancellable and happens before the request timeout. Gameplay changes no longer bypass scan or helper retry deadlines, or reset failure escalation. Diagnostics record only fixed surface/failure categories and status codes, without URLs, account IDs, cookies, tokens or response bodies.
+
+Both x64 Release executables build without compiler warnings/errors and all 11 automated regression suites pass. New fake-response/clock coverage exercises remembered-session restoration, true expiry, account mismatch, malformed pages, cancellation, successful sign-in during a cooldown, cooldown expiration, official script/HTTP redirects, superseded navigation IDs and unfinished login navigation. HTTP tests cover shared spacing/client replacement, delta/date/default Retry-After, clock jumps, queued waiters, cancellation and preservation of login on API 401. Controller tests prove 400 identical activity observations over 20 minutes make only three scheduled scans, and changed activity cannot bypass 30/60-second scan or 5-60-second helper backoff. All 60 synthetic light/dark DPI form renders still pass; actual monitor DPI changes were not performed.
+
+One minimal live identity-only check on this development host verified the app-owned remembered account successfully in 1.86 seconds. It required zero browser renewal attempts, so this confirms that the current saved account remains valid, but does not prove renewal after a real cookie expiry. No library/card scan or helper launch was performed by that check. Real expired-session restoration and sustained card idling in this build remain user-operated checks. Earlier preview.5 aggregate card results below are historical, not preview.6 live evidence.
 
 ## Fix and verification in preview.5
 

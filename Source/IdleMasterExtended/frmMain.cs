@@ -229,17 +229,33 @@ namespace IdleMasterExtended
                     authenticated = false; lastFailure = SteamReadStatus.LoginRequired;
                     return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.LoginRequired, UiText.Get("account_changed"));
                 }
-                var library = new OwnedGamesReader(session.Client);
                 var whitelist = (forRun ? runMode : SelectedMode) == IdleMode.Whitelist
                     ? (forRun ? runWhitelist : (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>())
                     : null;
-                var read = await new GameQueueScanner(session.Client, library, library)
-                    .ReadAsync(login.Value.ProfileUrl, whitelist, token, ids => OnUiAsync(() =>
-                    {
-                        token.ThrowIfCancellationRequested();
-                        ApplyVerifiedPrivacy(ids, login.Value.SteamId);
-                        return Task.FromResult(true);
-                    }));
+                Func<Task<SteamReadResult<GameQueueSnapshot>>> readQueue = () =>
+                {
+                    var library = new OwnedGamesReader(session.Client);
+                    return new GameQueueScanner(session.Client, library, library)
+                        .ReadAsync(login.Value.ProfileUrl, whitelist, token, ids => OnUiAsync(() =>
+                        {
+                            token.ThrowIfCancellationRequested();
+                            ApplyVerifiedPrivacy(ids, login.Value.SteamId);
+                            return Task.FromResult(true);
+                        }));
+                };
+                var read = await readQueue();
+                if (read.Status == SteamReadStatus.LoginRequired)
+                {
+                    // An access cookie can expire partway through a multi-page scan. Restore
+                    // through Steam once, then restart the atomic scan instead of publishing it.
+                    session.InvalidateVerification();
+                    var restored = await session.ValidateAsync(token);
+                    if (restored.IsSuccess && restored.Value.SteamId == login.Value.SteamId)
+                        read = await readQueue();
+                    else
+                        read = SteamReadResult<GameQueueSnapshot>.Failed(restored.IsSuccess ? SteamReadStatus.LoginRequired : restored.Status,
+                            restored.IsSuccess ? UiText.Get("account_changed") : restored.Message);
+                }
                 token.ThrowIfCancellationRequested();
                 if (!read.IsSuccess)
                 {
@@ -513,7 +529,7 @@ namespace IdleMasterExtended
             settingsToolStripMenuItem.Enabled = !busy; whitelistToolStripMenuItem.Enabled = blacklistToolStripMenuItem.Enabled = !busy;
             lnkSignIn.Visible = !authenticated; lnkResetCookies.Visible = authenticated;
             lnkSignIn.Enabled = !busy && !Running; lnkResetCookies.Enabled = switchAccount.Enabled = !busy;
-            switchAccount.Visible = authenticated || lastFailure == SteamReadStatus.MalformedPage;
+            switchAccount.Visible = authenticated || session.Current != null || lastFailure == SteamReadStatus.MalformedPage;
             lblCookieStatus.Text = lastFailure == SteamReadStatus.TransientFailure || lastFailure == SteamReadStatus.MalformedPage ? UiText.Get("account_unavailable") : authenticated ? UiText.Get("account_connected") : UiText.Get("sign_in_required");
             picCookieStatus.Image = StatusImage(authenticated);
             lblSignedOnAs.Visible = authenticated && Settings.Default.showUsername;
