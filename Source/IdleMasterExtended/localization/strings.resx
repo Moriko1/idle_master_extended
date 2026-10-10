@@ -321,4 +321,11 @@ Games remaining at last check: {4}</value></data>
   <data name="steam_account_mismatch" xml:space="preserve"><value>Steam client account differs from sign-in</value></data>
   <data name="steam_account_changed_pause" xml:space="preserve"><value>Steam account changed. Helpers stopped. Switch account or return to the signed-in account, then Resume.</value></data>
   <data name="steam_closed_pause" xml:space="preserve"><value>Steam closed. Helpers stopped and the queue was kept. Open Steam, then press Resume.</value></data>
+  <data name="scan_private_games" xml:space="preserve"><value>Checking private games...</value></data>
+  <data name="scan_owned_games" xml:space="preserve"><value>Checking owned games...</value></data>
+  <data name="scan_badge_pages" xml:space="preserve"><value>Checking badge pages: {0} / {1}</value></data>
+  <data name="scan_card_pages" xml:space="preserve"><value>Checking card drops: {0} / {1}</value></data>
+  <data name="scan_cancelled" xml:space="preserve"><value>Card check cancelled. Your previous counts have been kept.</value></data>
+  <data name="cancel_scan" xml:space="preserve"><value>Cancel</value></data>
+  <data name="signout_wait" xml:space="preserve"><value>Steam sign-out is still finishing. Retry shortly.</value></data>
 </root>

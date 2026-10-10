@@ -56,7 +56,7 @@ namespace IdleMasterExtended
             {
                 // Poll cookie changes locally; never query /my every three seconds while
                 // Steam is waiting for a password, Guard challenge, or QR confirmation.
-                var cookies = await session.Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
+                var cookies = await AsyncDeadline.WaitAsync(session.Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/"), TimeSpan.FromSeconds(10), lifetime.Token);
                 if (lifetime.IsCancellationRequested) return;
                 var login = System.Linq.Enumerable.FirstOrDefault(cookies,
                     c => c.Name == "steamLoginSecure" && SteamSessionService.IsCommunityCookie(c.Name, c.Domain));

@@ -29,8 +29,9 @@ requires verified access to the same account; cookies or a successful page load 
 
 ## Everyday controls
 
-- **Refresh** checks Steam for available drops; **Retry** repeats a failed check.
-- Rate-limit responses honor Steam's retry delay. App HTTP reads share a one-second spacing budget across Community and library checks; rate limits do not cause immediate retries.
+- **Refresh** checks Steam for available drops; **Retry** repeats a failed check. Scans show page/detail progress and offer **Cancel scan** while keeping previous counts.
+- **Start** can use a complete scan from the last two minutes after a fresh private-game check. **Resume** and manual **Refresh** perform a full scan.
+- App Community/library HTTP requests start at least 500 ms apart, with at most two card-detail reads in flight. Rate limits honor Steam's retry delay and do not cause immediate retries.
 - Temporary network errors and unreadable card pages preserve the last successful counts. Running helpers continue while card checks retry automatically. Steam server reconnects also keep the verified account idling.
 - When you launch a Steam game, every mode switches to preparation only: known games below the estimated two-hour threshold can warm up, then their helpers stop. Card idling returns automatically when your game closes. Ready games and whitelist entries with unknown hours wait while you play; the queue stays active. The game you are playing is excluded when its app ID can be detected.
 - Single, One then many, Many then one, Fast, and Whitelist modes remain available in Settings; their normal behavior returns outside gameplay.
@@ -41,6 +42,7 @@ requires verified access to the same account; cookies or a successful page load 
 - Show Steam username defaults to on. Saved preferences survive restarts and portable-folder upgrades.
 - **Start** stays disabled when there are no eligible games.
 - Settings changes apply only on **Save**. **Cancel** discards edits and leaves idling alone. During a session, appearance and sleep settings apply immediately; mode and filter changes apply to the next session.
+- Canceling Settings or closing an unfinished sign-in window does not trigger another scan.
 - Closing the app stops its helpers. Sleep prevention applies only while idling.
 - Shutdown after completion remains an optional one-run setting, disabled by default. Its completion summary offers a shutdown button; completion does not open a system prompt.
 
@@ -48,6 +50,7 @@ The browser session and diagnostic logs are stored under
 `%LocalAppData%\IdleMasterExtended\Moriko1`.
 Ordinary preferences use `preferences.xml` in that same folder, with atomic saves and a backup; cookies remain in the browser profile. Existing ordinary settings are migrated when available.
 Logs contain operation names, categorical request outcomes and exception types/stacks, not URLs, account IDs, cookies, passwords or page contents.
+`Logs\scans.log` records only scan outcomes, elapsed time and aggregate page/detail counts.
 Upgrading from upstream requires one fresh Steam sign-in; copied-cookie login is retired.
 
 ## Building and verification

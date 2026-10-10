@@ -34,11 +34,20 @@ namespace IdleMasterExtended
         private readonly ICommunityClient community;
         private readonly Func<HttpMessageHandler> transportFactory;
         private readonly SteamRequestBudget requestBudget;
+        private readonly Func<TimeSpan> elapsed;
+        private readonly SemaphoreSlim proofGate = new SemaphoreSlim(1, 1);
+        private readonly object proofSync = new object();
+        private string proofAccount;
+        private string proofToken;
+        private TimeSpan? proofAt;
 
-        public OwnedGamesReader(ICommunityClient community, Func<HttpMessageHandler> transportFactory = null, SteamRequestBudget requestBudget = null)
+        public OwnedGamesReader(ICommunityClient community, Func<HttpMessageHandler> transportFactory = null,
+            SteamRequestBudget requestBudget = null, Func<TimeSpan> elapsed = null)
         {
             this.community = community ?? throw new ArgumentNullException(nameof(community));
             this.requestBudget = requestBudget ?? (community as SteamHttpClient)?.RequestBudget ?? SteamRequestBudget.Shared;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            this.elapsed = elapsed ?? (() => stopwatch.Elapsed);
             this.transportFactory = transportFactory ?? (() => new HttpClientHandler
             {
                 UseCookies = false,
@@ -65,18 +74,10 @@ namespace IdleMasterExtended
             var account = Regex.Match(profile.AbsolutePath, @"^/profiles/([0-9]{17})/?$");
             if (!account.Success || account.Groups[1].Value.All(ch => ch == '0')) return Failed(privateGames);
             var steamId = account.Groups[1].Value;
-            var url = profile.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/games/?tab=all&l=english";
-            var bounded = community as IBoundedCommunityClient;
-            var page = bounded == null ? await community.GetAsync(url, cancellationToken).ConfigureAwait(false)
-                : await bounded.GetAsync(url, SteamHttpClient.MaximumResponseLimit, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!page.IsSuccess)
-                return SteamReadResult<HashSet<int>>.Failed(page.Status, page.Message);
-            string token;
-            var proof = TrySessionProof(page.Value, steamId, out token);
-            if (proof != SteamReadStatus.Success)
-                return SteamReadResult<HashSet<int>>.Failed(proof,
-                    proof == SteamReadStatus.LoginRequired ? "Sign in to the same Steam account again to continue." : privateGames ? InvalidPrivateList : InvalidLibrary);
+            var proof = await ReadSessionProofAsync(profile, steamId, privateGames, cancellationToken).ConfigureAwait(false);
+            if (!proof.IsSuccess)
+                return SteamReadResult<HashSet<int>>.Failed(proof.Status, proof.Message);
+            var token = proof.Value;
 
             // Current official Community transport/token contract:
             // https://cdn.fastly.steamstatic.com/steamcommunity/public/ssr/CFcRBfQR.js
@@ -86,7 +87,7 @@ namespace IdleMasterExtended
             // https://cdn.fastly.steamstatic.com/steamcommunity/public/ssr/MZknbyKp.js
             var input = privateGames ? new Dictionary<string, object>() : new Dictionary<string, object>
             {
-                { "steamid", steamId }, { "include_appinfo", true },
+                { "steamid", steamId }, { "include_appinfo", false },
                 { "include_played_free_games", true }, { "include_free_sub", true },
                 { "skip_unvetted_apps", false }, { "include_family_licenses", true }
             };
@@ -100,6 +101,18 @@ namespace IdleMasterExtended
                 // Community and API reads share spacing/cooldowns across sessions and scans.
                 // Returning the first transient failure lets the controller schedule recovery.
                 await requestBudget.WaitForTurnAsync(cancellationToken).ConfigureAwait(false);
+                while (!IsProofFresh(steamId, token))
+                {
+                    // A longer server cooldown can outlast cached proof before this send.
+                    // Renew that proof, then reserve a separately spaced API send.
+                    proof = await ReadSessionProofAsync(profile, steamId, privateGames, cancellationToken).ConfigureAwait(false);
+                    if (!proof.IsSuccess)
+                        return SteamReadResult<HashSet<int>>.Failed(proof.Status, proof.Message);
+                    token = proof.Value;
+                    requestUrl = (privateGames ? PrivateApiEndpoint : ApiEndpoint) + "?access_token=" + Uri.EscapeDataString(token)
+                        + "&input_json=" + Uri.EscapeDataString(Serializer().Serialize(input)) + "&format=json";
+                    await requestBudget.WaitForTurnAsync(cancellationToken).ConfigureAwait(false);
+                }
                 using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
                     deadline.CancelAfter(TimeSpan.FromSeconds(15));
@@ -112,6 +125,7 @@ namespace IdleMasterExtended
                             deadline.Token.ThrowIfCancellationRequested();
                             var status = (int)response.StatusCode;
                             requestBudget.ObserveResponse(SteamRequestSurface.LibraryApi, response);
+                            if (status == 401) InvalidateProof(steamId, token);
                             // This token is shorter lived than the already verified browser session.
                             // Its rejection is not evidence that remembered Community login expired.
                             if (status == 401 || status == 403 || status == 429 || status == 408 || status >= 500)
@@ -144,6 +158,67 @@ namespace IdleMasterExtended
                         return SteamReadResult<HashSet<int>>.Failed(SteamReadStatus.TransientFailure, "Steam's " + listName + " was interrupted. Try again shortly.");
                     }
                 }
+            }
+        }
+
+        private async Task<SteamReadResult<string>> ReadSessionProofAsync(Uri profile, string steamId,
+            bool privateGames, CancellationToken cancellationToken)
+        {
+            await proofGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                lock (proofSync)
+                {
+                    var now = elapsed();
+                    if (proofAccount == steamId && proofAt.HasValue && now >= proofAt.Value
+                        && now - proofAt.Value < TimeSpan.FromMinutes(2))
+                        return SteamReadResult<string>.Succeeded(proofToken);
+                    // A new account, expired proof or failed replacement cannot inherit old proof.
+                    proofAccount = proofToken = null;
+                    proofAt = null;
+                }
+                var url = profile.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/games/?tab=all&l=english";
+                var bounded = community as IBoundedCommunityClient;
+                var page = bounded == null ? await community.GetAsync(url, cancellationToken).ConfigureAwait(false)
+                    : await bounded.GetAsync(url, SteamHttpClient.MaximumResponseLimit, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!page.IsSuccess) return SteamReadResult<string>.Failed(page.Status, page.Message);
+                string token;
+                var status = TrySessionProof(page.Value, steamId, out token);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (status != SteamReadStatus.Success)
+                    return SteamReadResult<string>.Failed(status,
+                        status == SteamReadStatus.LoginRequired ? "Sign in to the same Steam account again to continue." : privateGames ? InvalidPrivateList : InvalidLibrary);
+                lock (proofSync)
+                {
+                    proofAccount = steamId;
+                    proofToken = token;
+                    proofAt = elapsed();
+                }
+                return SteamReadResult<string>.Succeeded(token);
+            }
+            finally { proofGate.Release(); }
+        }
+
+        private void InvalidateProof(string steamId, string token)
+        {
+            lock (proofSync)
+            {
+                // A delayed failure from an older request must not discard newer account proof.
+                if (proofAccount != steamId || proofToken != token) return;
+                proofAccount = proofToken = null;
+                proofAt = null;
+            }
+        }
+
+        private bool IsProofFresh(string steamId, string token)
+        {
+            lock (proofSync)
+            {
+                var now = elapsed();
+                return proofAccount == steamId && proofToken == token && proofAt.HasValue
+                    && now >= proofAt.Value && now - proofAt.Value < TimeSpan.FromMinutes(2);
             }
         }
 

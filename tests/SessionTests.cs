@@ -10,6 +10,23 @@ namespace IdleMasterExtended.Tests
         public static void RunAll()
         {
             RememberedSessionRecovery().GetAwaiter().GetResult();
+            // Earlier desktop fixtures install a WinForms context without a message loop.
+            // These pure fake-task deadlines run without that context; production keeps UI affinity.
+            var context = SynchronizationContext.Current;
+            try { SynchronizationContext.SetSynchronizationContext(null); AsyncDeadlineTests.RunAllAsync().GetAwaiter().GetResult(); }
+            finally { SynchronizationContext.SetSynchronizationContext(context); }
+            using (var service = new SteamSessionService())
+            {
+                var cleanup = new TaskCompletionSource<bool>();
+                typeof(SteamSessionService).GetField("profileCleanup", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                    .SetValue(service, cleanup.Task);
+                Test.Assert(service.IsCleaningUp && !service.IsInitialized &&
+                    service.ValidateAsync(CancellationToken.None).GetAwaiter().GetResult().Status == SteamReadStatus.TransientFailure,
+                    "An unfinished profile clear blocks browser reuse without reporting expired login.");
+                cleanup.SetResult(true);
+                Test.Assert(!service.IsCleaningUp, "Completed profile cleanup releases its sign-in guard.");
+            }
+
             CookieBridgeIgnoresBrowserPreferences();
             CookieBridgeRejectsInvalidAuthentication();
             const ulong id = 76561198000000001;

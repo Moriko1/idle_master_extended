@@ -10,6 +10,19 @@ using HtmlAgilityPack;
 
 namespace IdleMasterExtended
 {
+    public enum BadgeScanStage { PrivateGames, BadgePages, OwnedGames, GameDetails }
+
+    public sealed class BadgeScanProgress
+    {
+        public BadgeScanStage Stage { get; }
+        public int Completed { get; }
+        public int Total { get; }
+        public BadgeScanProgress(BadgeScanStage stage, int completed, int total)
+        {
+            Stage = stage; Completed = completed; Total = total;
+        }
+    }
+
     /// <summary>Parses a complete badge snapshot before publishing any changes.</summary>
     public sealed class BadgeScanner
     {
@@ -34,7 +47,8 @@ namespace IdleMasterExtended
             this.privateApps = new HashSet<int>(privateApps ?? Enumerable.Empty<int>());
         }
 
-        public async Task<SteamReadResult<List<Badge>>> ScanAsync(string profileUrl, CancellationToken cancellationToken)
+        public async Task<SteamReadResult<List<Badge>>> ScanAsync(string profileUrl, CancellationToken cancellationToken,
+            Action<BadgeScanProgress> progress = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             string profile;
@@ -42,9 +56,10 @@ namespace IdleMasterExtended
                 return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "The Steam profile address is invalid.");
 
             var snapshot = new Dictionary<int, Badge>();
+            var pendingDetails = new Dictionary<int, Badge>();
             var pageCount = 1;
-            var detailReads = 0;
             HashSet<int> ownedApps = null;
+            ReportProgress(progress, BadgeScanStage.BadgePages, 0, pageCount);
             for (var pageNumber = 1; pageNumber <= pageCount; pageNumber++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -69,7 +84,10 @@ namespace IdleMasterExtended
 
                 var rows = document.DocumentNode.SelectNodes("//div[" + ClassToken("badge_row") + "]");
                 if (rows == null)
+                {
+                    ReportProgress(progress, BadgeScanStage.BadgePages, pageNumber, pageCount);
                     continue; // A recognized empty badge sheet is a successful zero-game snapshot.
+                }
                 foreach (var row in rows)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -99,8 +117,9 @@ namespace IdleMasterExtended
                         // without inventing zero drops or requesting an ineligible card page.
                         int privateCards; double privateHours;
                         var known = TryStats(row, out privateCards, out privateHours);
-                        snapshot[appId] = new Badge { AppId = appId, Name = string.IsNullOrWhiteSpace(name) ? "App ID: " + appId : name,
+                        var badge = new Badge { AppId = appId, Name = string.IsNullOrWhiteSpace(name) ? "App ID: " + appId : name,
                             IsPrivate = true, RemainingCard = known ? privateCards : -1, HoursPlayed = known ? privateHours : 0 };
+                        if (!TryAddBadge(snapshot, badge)) return ConflictingBadges();
                         continue;
                     }
                     if (string.IsNullOrWhiteSpace(name))
@@ -115,37 +134,128 @@ namespace IdleMasterExtended
                         // A missing section or an unfamiliar nonempty status is still invalid.
                         if (!HasEmptyDropsSection(row))
                             return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam's card counts could not be read. Your previous game list has been kept.");
-                        // Once this scan has a complete verified ownership set, absent apps
-                        // cannot be idled by this account. Skip only genuinely empty index rows.
-                        if (ownedApps != null && !ownedApps.Contains(appId))
-                            continue;
-                        if (++detailReads > detailBudget)
-                            return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned too many badges with missing card counts. Your previous game list has been kept.");
-                        var detail = await ReadCardPageAsync(new Badge { AppId = appId, Name = name }, profile, cancellationToken).ConfigureAwait(false);
-                        if (detail.Result.IsSuccess)
+                        // A complete, authenticated ownership set excludes badges left behind
+                        // by games this account cannot idle. Obtain it before spending one
+                        // detail request per empty row; unknown or nonempty rows are never hidden.
+                        if (ownedApps == null && ownedGames != null)
                         {
-                            snapshot[appId] = detail.Result.Value;
-                            continue;
-                        }
-                        if (detail.Result.Status != SteamReadStatus.MalformedPage || !detail.EmptyDrops || ownedGames == null)
-                            return SteamReadResult<List<Badge>>.Failed(detail.Result.Status, detail.Result.Message);
-                        if (ownedApps == null)
-                        {
+                            ReportProgress(progress, BadgeScanStage.OwnedGames, 0, 1);
                             var ownership = await ownedGames.ReadAsync(profile, cancellationToken).ConfigureAwait(false);
                             cancellationToken.ThrowIfCancellationRequested();
                             if (!ownership.IsSuccess)
                                 return SteamReadResult<List<Badge>>.Failed(ownership.Status, ownership.Message);
-                            ownedApps = ownership.Value;
+                            if (ownership.Value == null || ownership.Value.Any(id => id <= 0))
+                                return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam's owned game list could not be verified. Your previous game list has been kept.");
+                            ownedApps = new HashSet<int>(ownership.Value);
+                            ReportProgress(progress, BadgeScanStage.OwnedGames, 1, 1);
+                            ReportProgress(progress, BadgeScanStage.BadgePages, pageNumber - 1, pageCount);
                         }
-                        if (!ownedApps.Contains(appId))
+                        if (ownedApps != null && !ownedApps.Contains(appId))
                             continue;
-                        return SteamReadResult<List<Badge>>.Failed(detail.Result.Status, detail.Result.Message);
+
+                        if (!pendingDetails.ContainsKey(appId))
+                        {
+                            if (pendingDetails.Count >= detailBudget)
+                                return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage, "Steam returned too many badges with missing card counts. Your previous game list has been kept.");
+                            pendingDetails.Add(appId, new Badge { AppId = appId, Name = name });
+                        }
+                        continue;
                     }
-                    snapshot[appId] = new Badge { AppId = appId, Name = name, RemainingCard = cards, HoursPlayed = hours };
+                    if (!TryAddBadge(snapshot, new Badge { AppId = appId, Name = name, RemainingCard = cards, HoursPlayed = hours }))
+                        return ConflictingBadges();
                 }
+                ReportProgress(progress, BadgeScanStage.BadgePages, pageNumber, pageCount);
             }
             cancellationToken.ThrowIfCancellationRequested();
+            if (pendingDetails.Count != 0)
+                return await ReadDetailsAsync(pendingDetails.Values.ToList(), snapshot, profile, cancellationToken, progress).ConfigureAwait(false);
             return SteamReadResult<List<Badge>>.Succeeded(snapshot.Values.ToList());
+        }
+
+        private async Task<SteamReadResult<List<Badge>>> ReadDetailsAsync(List<Badge> pending,
+            Dictionary<int, Badge> snapshot, string profile, CancellationToken token, Action<BadgeScanProgress> progress)
+        {
+            var sync = new object();
+            var progressSync = new object();
+            var next = 0;
+            var completed = 0;
+            var results = new Badge[pending.Count];
+            SteamReadResult<Badge> failure = null;
+            using (var abort = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                ReportProgress(progress, BadgeScanStage.GameDetails, 0, pending.Count);
+                Func<Task> worker = async () =>
+                {
+                    while (true)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        int index;
+                        lock (sync)
+                        {
+                            if (abort.IsCancellationRequested || next == pending.Count) return;
+                            index = next++;
+                        }
+                        try
+                        {
+                            var detail = await ReadCardPageAsync(pending[index], profile, abort.Token).ConfigureAwait(false);
+                            token.ThrowIfCancellationRequested();
+                            if (!detail.IsSuccess)
+                            {
+                                lock (sync) if (failure == null) failure = detail;
+                                abort.Cancel();
+                                return;
+                            }
+                            lock (sync)
+                            {
+                                if (abort.IsCancellationRequested) return;
+                                results[index] = detail.Value;
+                            }
+                            lock (progressSync)
+                                ReportProgress(progress, BadgeScanStage.GameDetails, ++completed, pending.Count);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            if (!abort.IsCancellationRequested) { abort.Cancel(); throw; }
+                            return;
+                        }
+                        catch
+                        {
+                            abort.Cancel();
+                            throw;
+                        }
+                    }
+                };
+                // Exactly two async workers; never allocate a task per game or bypass HTTP pacing.
+                await Task.WhenAll(worker(), worker()).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                if (failure != null) return SteamReadResult<List<Badge>>.Failed(failure.Status, failure.Message);
+                foreach (var detail in results)
+                    if (!TryAddBadge(snapshot, detail)) return ConflictingBadges();
+                return SteamReadResult<List<Badge>>.Succeeded(snapshot.Values.ToList());
+            }
+        }
+
+        internal static void ReportProgress(Action<BadgeScanProgress> progress, BadgeScanStage stage, int completed, int total)
+        {
+            try { progress?.Invoke(new BadgeScanProgress(stage, completed, total)); }
+            catch { /* Display progress is optional and cannot alter the verified snapshot. */ }
+        }
+
+        private static bool TryAddBadge(Dictionary<int, Badge> snapshot, Badge badge)
+        {
+            Badge previous;
+            if (snapshot.TryGetValue(badge.AppId, out previous) &&
+                (previous.RemainingCard != badge.RemainingCard || previous.HoursPlayed != badge.HoursPlayed || previous.IsPrivate != badge.IsPrivate))
+                return false;
+            snapshot[badge.AppId] = badge;
+            return true;
+        }
+
+        private static SteamReadResult<List<Badge>> ConflictingBadges()
+        {
+            return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.MalformedPage,
+                "Steam returned conflicting counts for the same game. Your previous game list has been kept.");
         }
 
         /// <summary>Returns a new badge; callers apply it only after a successful read.</summary>
@@ -155,45 +265,31 @@ namespace IdleMasterExtended
             string profile;
             if (badge == null || badge.AppId <= 0 || !TryProfileUrl(profileUrl, out profile))
                 return SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage, "The Steam game or profile address is invalid.");
-            return (await ReadCardPageAsync(badge, profile, cancellationToken).ConfigureAwait(false)).Result;
+            return await ReadCardPageAsync(badge, profile, cancellationToken).ConfigureAwait(false);
         }
 
-        private async Task<CardPageRead> ReadCardPageAsync(Badge badge, string profile, CancellationToken cancellationToken)
+        private async Task<SteamReadResult<Badge>> ReadCardPageAsync(Badge badge, string profile, CancellationToken cancellationToken)
         {
             var read = await community.GetAsync(profile + "/gamecards/" + badge.StringId + "/?l=english", cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (!read.IsSuccess)
-                return new CardPageRead(SteamReadResult<Badge>.Failed(read.Status, read.Message), false);
+                return SteamReadResult<Badge>.Failed(read.Status, read.Message);
             var document = ReadDocument(read.Value);
             var problem = PageProblem(document, read.Value);
             if (problem != null)
-                return new CardPageRead(SteamReadResult<Badge>.Failed(problem.Status, problem.Message), false);
+                return SteamReadResult<Badge>.Failed(problem.Status, problem.Message);
             int cards;
             double hours;
             if (!TryStats(document.DocumentNode, out cards, out hours))
             {
-                var empty = document.DocumentNode.SelectSingleNode("//*[" + ClassToken("badge_gamecard_page") + "]") != null
-                    && document.DocumentNode.SelectSingleNode("//*[" + ClassToken("badge_title_stats_playtime") + "]") != null
-                    && HasEmptyDropsSection(document.DocumentNode);
-                return new CardPageRead(SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage,
-                    "Steam's card counts could not be read. The previous count has been kept."), empty);
+                return SteamReadResult<Badge>.Failed(SteamReadStatus.MalformedPage,
+                    "Steam's card counts could not be read. The previous count has been kept.");
             }
-            return new CardPageRead(SteamReadResult<Badge>.Succeeded(new Badge
+            return SteamReadResult<Badge>.Succeeded(new Badge
             {
                 AppId = badge.AppId, Name = badge.Name, AveragePrice = badge.AveragePrice,
                 RemainingCard = cards, HoursPlayed = hours
-            }), false);
-        }
-
-        private sealed class CardPageRead
-        {
-            public SteamReadResult<Badge> Result { get; }
-            public bool EmptyDrops { get; }
-            public CardPageRead(SteamReadResult<Badge> result, bool emptyDrops)
-            {
-                Result = result;
-                EmptyDrops = emptyDrops;
-            }
+            });
         }
 
         private static HtmlDocument ReadDocument(string html)

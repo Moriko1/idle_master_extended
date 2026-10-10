@@ -29,8 +29,10 @@ namespace IdleMasterExtended
         public SteamSession Current { get; private set; }
         public SteamHttpClient Client { get; private set; }
         internal int RecoveryAttempts { get; private set; }
-        private bool disposed;
-        public bool IsInitialized => !disposed && Browser != null && !Browser.IsDisposed && Browser.CoreWebView2 != null;
+        private bool disposed, configured;
+        private Task profileCleanup;
+        internal bool IsCleaningUp => profileCleanup != null && !profileCleanup.IsCompleted;
+        public bool IsInitialized => configured && !IsCleaningUp && !disposed && Browser != null && !Browser.IsDisposed && Browser.CoreWebView2 != null;
         public static bool IsTrustedSteamUri(string value)
         {
             return Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && string.IsNullOrEmpty(uri.UserInfo) &&
@@ -39,13 +41,19 @@ namespace IdleMasterExtended
                  uri.Host.Equals("store.steampowered.com", StringComparison.OrdinalIgnoreCase) ||
                  uri.Host.Equals("help.steampowered.com", StringComparison.OrdinalIgnoreCase));
         }
-        public async Task InitializeAsync(WebView2 browser)
+        public async Task InitializeAsync(WebView2 browser, CancellationToken token = default(CancellationToken))
         {
             if (IsInitialized) return;
+            if (IsCleaningUp) throw new InvalidOperationException("Steam browser data is still being cleared.");
+            token.ThrowIfCancellationRequested();
             System.IO.Directory.CreateDirectory(AppPaths.Data);
-            Browser = browser;
-            var environment = await CoreWebView2Environment.CreateAsync(null, AppPaths.BrowserProfile);
-            await browser.EnsureCoreWebView2Async(environment);
+            Browser = browser; configured = false;
+            if (browser.CoreWebView2 == null)
+            {
+                var environment = await AsyncDeadline.WaitAsync(CoreWebView2Environment.CreateAsync(null, AppPaths.BrowserProfile), TimeSpan.FromSeconds(30), token);
+                await AsyncDeadline.WaitAsync(browser.EnsureCoreWebView2Async(environment), TimeSpan.FromSeconds(30), token);
+            }
+            token.ThrowIfCancellationRequested();
             browser.CoreWebView2.Profile.IsPasswordAutosaveEnabled = false;
             browser.CoreWebView2.Profile.IsGeneralAutofillEnabled = false;
             browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
@@ -59,6 +67,7 @@ namespace IdleMasterExtended
                 e.Handled = true;
                 if (IsTrustedSteamUri(e.Uri)) browser.CoreWebView2.Navigate(e.Uri);
             };
+            configured = true;
         }
         internal void InvalidateVerification() { verifiedAt = null; verifiedCookie = null; }
         public async Task<SteamReadResult<SteamSession>> ValidateAsync(CancellationToken token, bool restoreRemembered = true)
@@ -66,12 +75,13 @@ namespace IdleMasterExtended
             await gate.WaitAsync(token);
             try
             {
+                if (IsCleaningUp) return SteamReadResult<SteamSession>.Failed(SteamReadStatus.TransientFailure, "Steam sign-out is still finishing. Retry shortly.");
                 if (!IsInitialized) return SteamReadResult<SteamSession>.Failed(SteamReadStatus.LoginRequired, "Sign in to Steam.");
                 var pinnedId = Current?.SteamId ?? 0;
                 var accountChanged = false;
                 Func<Task<SteamReadResult<SteamSession>>> read = async () =>
                 {
-                    var cookies = await Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/");
+                    var cookies = await AsyncDeadline.WaitAsync(Browser.CoreWebView2.CookieManager.GetCookiesAsync("https://steamcommunity.com/"), TimeSpan.FromSeconds(10), token);
                     token.ThrowIfCancellationRequested();
                     var login = cookies.FirstOrDefault(c => c.Name == "steamLoginSecure" && IsCommunityCookie(c.Name, c.Domain));
                     if (login == null || !TryReadCookieIdentity(login.Value, out var expected))
@@ -96,7 +106,7 @@ namespace IdleMasterExtended
                     {
                         var response = await candidate.GetAsync("https://steamcommunity.com/my/?l=english", token);
                         if (!response.IsSuccess) return SteamReadResult<SteamSession>.Failed(response.Status, response.Message);
-                        var identity = ParseIdentity(response.Value, expected);
+                        var identity = await Task.Run(() => ParseIdentity(response.Value, expected), token);
                         if (!identity.IsSuccess)
                         {
                             accountChanged = HasDifferentViewer(response.Value, expected);
@@ -235,16 +245,17 @@ namespace IdleMasterExtended
             catch (InvalidOperationException) { }
             catch (System.Runtime.InteropServices.COMException) { }
         }
-        public async Task SignOutAsync()
+        public async Task SignOutAsync(CancellationToken token = default(CancellationToken))
         {
-            await gate.WaitAsync();
+            await gate.WaitAsync(token);
             try
             {
                 Current = null; Client?.Dispose(); Client = null; recovery.Reset(); verifiedAt = null; verifiedCookie = null;
                 if (IsInitialized)
                 {
                     Browser.CoreWebView2.CookieManager.DeleteAllCookies();
-                    await Browser.CoreWebView2.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile);
+                    profileCleanup = Browser.CoreWebView2.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile);
+                    await AsyncDeadline.WaitAsync(profileCleanup, TimeSpan.FromSeconds(20), token);
                     if (IsInitialized) Browser.CoreWebView2.Navigate("about:blank");
                 }
             }

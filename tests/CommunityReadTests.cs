@@ -19,11 +19,15 @@ namespace IdleMasterExtended.Tests
             await SnapshotIsCompleteAndPaginationIsNumeric();
             await FailedReadsKeepPriorCounts();
             await EmptyIndexDropsRequireDetailEvidence();
-            await UnownedExclusionRequiresEmptyDetailAndVerifiedLibrary();
+            await VerifiedOwnershipSkipsEmptyUnownedRows();
+            await DetailsAreDeduplicatedWithinOneAtomicScan();
+            await ParallelDetailsAreBoundedAndCancelable();
+            await LargeScanRequestBudgetProof();
             await OwnedGamesTests.RunAllAsync();
             await EmptyAndMalformedPagesAreDifferent();
             await HttpFailuresAndRedirectsAreTyped();
             await RequestBudgetsSurviveClientReplacement();
+            await ProductionSpacingRemainsBounded();
             await RetryAfterUsesMonotonicCooldowns();
             await CanceledWaitDoesNotEraseTheCooldown();
             await ConcurrentWaitersRespectSpacingAndExtendedCooldowns();
@@ -99,9 +103,9 @@ namespace IdleMasterExtended.Tests
                     "Unrelated detail-page digits replaced a previous card count.");
                 var community = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(EmptyDropRow(10))),
                     SteamReadResult<string>.Succeeded(page.Replace("badge_row is_link", "badge_row badge_gamecard_page")));
-                var ownership = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int>()));
+                var ownership = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10 }));
                 var fallback = await new BadgeScanner(community, ownership).ScanAsync(Profile, CancellationToken.None);
-                Require(fallback.Status == SteamReadStatus.MalformedPage && ownership.Calls == 0,
+                Require(fallback.Status == SteamReadStatus.MalformedPage && ownership.Calls == 1,
                     "Ownership proof hid a nonempty unrecognized detail status.");
             }
             var popupOnly = EmptyDropRow(10).Replace("<div class='badge_title_stats_drops'>  </div>",
@@ -162,7 +166,7 @@ namespace IdleMasterExtended.Tests
                 Page(Row(id, "Detail", "No card drops remaining", "")))));
             client = new FakeCommunity(responses.ToArray());
             scan = await new BadgeScanner(client, null, 3).ScanAsync(Profile, CancellationToken.None);
-            Require(scan.Status == SteamReadStatus.MalformedPage && scan.Value == null && client.Urls.Count == 4,
+            Require(scan.Status == SteamReadStatus.MalformedPage && scan.Value == null && client.Urls.Count == 1,
                 "Detail-page fallback requests exceeded their finite per-scan limit.");
 
             responses = new List<SteamReadResult<string>>
@@ -184,7 +188,7 @@ namespace IdleMasterExtended.Tests
         }
 
 
-        private static async Task UnownedExclusionRequiresEmptyDetailAndVerifiedLibrary()
+        private static async Task VerifiedOwnershipSkipsEmptyUnownedRows()
         {
             var index = Page(Row(10, "Known", "3 card drops remaining", "1 hr on record"), EmptyDropRow(20), EmptyDropRow(30));
             var detail = Page(EmptyDropRow(20).Replace("badge_row is_link", "badge_row badge_gamecard_page"));
@@ -193,17 +197,23 @@ namespace IdleMasterExtended.Tests
             var owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10 }));
             var scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
             Require(scan.IsSuccess && scan.Value.Count == 1 && scan.Value[0].RemainingCard == 3
-                && owned.Calls == 1 && client.Urls.Count == 2,
-                "Proven unowned games were not excluded, their missing counts became zero, or cached ownership was ignored.");
+                && owned.Calls == 1 && client.Urls.Count == 1,
+                "Proven unowned empty index rows caused unnecessary detail requests or invented card counts.");
 
             var manyEmpty = new List<string> { Row(10, "Known", "3 card drops remaining", "1 hr on record") };
-            manyEmpty.AddRange(Enumerable.Range(20, 129).Select(EmptyDropRow));
+            manyEmpty.AddRange(Enumerable.Range(20, 1000).Select(EmptyDropRow));
             client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(manyEmpty.ToArray())),
                 SteamReadResult<string>.Succeeded(detail));
             owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10 }));
             scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
-            Require(scan.IsSuccess && scan.Value.Count == 1 && owned.Calls == 1 && client.Urls.Count == 2,
-                "A complete ownership proof still caused one detail request per unowned empty badge.");
+            Require(scan.IsSuccess && scan.Value.Count == 1 && owned.Calls == 1 && client.Urls.Count == 1,
+                "A thousand verified unowned empty badges still caused detail-page traffic.");
+
+            client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(EmptyDropRow(20), EmptyDropRow(30))));
+            owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int>()));
+            scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
+            Require(scan.IsSuccess && scan.Value.Count == 0 && owned.Calls == 1 && client.Urls.Count == 1,
+                "A first scan with a verified empty library did not produce a valid empty queue.");
 
             client = new FakeCommunity(SteamReadResult<string>.Succeeded(index), SteamReadResult<string>.Succeeded(detail));
             owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10, 20 }));
@@ -222,14 +232,183 @@ namespace IdleMasterExtended.Tests
             client = new FakeCommunity(SteamReadResult<string>.Succeeded(index), SteamReadResult<string>.Succeeded(Page(EmptyDropRow(20))));
             owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10 }));
             scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
-            Require(scan.Status == SteamReadStatus.MalformedPage && owned.Calls == 0,
-                "An unrecognized detail layout consulted ownership to hide a malformed count.");
+            Require(scan.IsSuccess && scan.Value.Count == 1 && owned.Calls == 1 && client.Urls.Count == 1,
+                "An unowned empty index row was fetched even after complete ownership proof.");
+
+            client = new FakeCommunity(SteamReadResult<string>.Succeeded(index), SteamReadResult<string>.Succeeded(Page(EmptyDropRow(20))));
+            owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10, 20 }));
+            scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
+            Require(scan.Status == SteamReadStatus.MalformedPage && scan.Value == null && client.Urls.Count == 2,
+                "Verified ownership hid an owned game's malformed detail count.");
 
             client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(
                 Row(20, "Game", "99 cards collected", "1 hr on record").Replace("badge_title_stats_drops", "unrelated_status"))));
+            owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int>()));
             scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
-            Require(scan.Status == SteamReadStatus.MalformedPage && client.Urls.Count == 1,
+            Require(scan.Status == SteamReadStatus.MalformedPage && client.Urls.Count == 1 && owned.Calls == 0,
                 "Unrelated progress digits were mistaken for a remaining-drop count.");
+        }
+
+        private static async Task DetailsAreDeduplicatedWithinOneAtomicScan()
+        {
+            var first = Page(EmptyDropRow(10), Row(20, "Known", "3 card drops remaining", "1 hr on record"))
+                .Replace("</body>", "<a class='pagelink' href='?p=2'>2</a></body>");
+            var second = Page(EmptyDropRow(10), EmptyDropRow(10), Row(20, "Known", "3 card drops remaining", "1 hr on record"));
+            var client = new FakeCommunity(SteamReadResult<string>.Succeeded(first), SteamReadResult<string>.Succeeded(second),
+                SteamReadResult<string>.Succeeded(Page(Row(10, "Detail", "No card drops remaining", "2.2 hrs on record"))));
+            var owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10, 20 }));
+            var progress = new List<BadgeScanProgress>();
+            var scan = await new BadgeScanner(client, owned, 1).ScanAsync(Profile, CancellationToken.None, progress.Add);
+            Require(scan.IsSuccess && scan.Value.Count == 2 && client.Urls.Count == 3 && owned.Calls == 1,
+                "Duplicate empty badges across pages consumed more than one fresh detail read.");
+            Require(client.Urls[1].Contains("?p=2&l=english") && client.Urls[2].Contains("/gamecards/10/"),
+                "Detail traffic began before the complete badge index was collected.");
+            var detailStart = progress.FindIndex(item => item.Stage == BadgeScanStage.GameDetails && item.Completed == 0);
+            Require(detailStart > 0 && progress.Take(detailStart).Any(item => item.Stage == BadgeScanStage.BadgePages && item.Completed == 2)
+                && progress.Last().Stage == BadgeScanStage.GameDetails && progress.Last().Completed == 1 && progress.Last().Total == 1,
+                "Progress did not distinguish complete badge pages from unique detail checks.");
+
+            client = new FakeCommunity(SteamReadResult<string>.Succeeded(first),
+                SteamReadResult<string>.Failed(SteamReadStatus.TransientFailure, "Synthetic later-page outage"));
+            scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
+            Require(scan.Status == SteamReadStatus.TransientFailure && scan.Value == null && client.Urls.Count == 2,
+                "A later badge-page failure spent detail traffic or published a partial zero-card queue.");
+
+            foreach (var duplicate in new[] { Row(10, "Same game", "4 card drops remaining", "1 hr on record"),
+                Row(10, "Same game", "3 card drops remaining", "1.5 hrs on record"),
+                Row(10, "Same game", "unrecognized status", "1 hr on record") })
+            {
+                client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(
+                    Row(10, "Same game", "3 card drops remaining", "1 hr on record"), duplicate)));
+                scan = await new BadgeScanner(client).ScanAsync(Profile, CancellationToken.None);
+                Require(scan.Status == SteamReadStatus.MalformedPage && scan.Value == null,
+                    "A conflicting or malformed duplicate silently replaced verified counts.");
+            }
+
+            client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(EmptyDropRow(10),
+                Row(10, "Same game", "4 card drops remaining", "2.2 hrs on record"))),
+                SteamReadResult<string>.Succeeded(Page(Row(10, "Detail", "No card drops remaining", "2.2 hrs on record"))));
+            scan = await new BadgeScanner(client, owned).ScanAsync(Profile, CancellationToken.None);
+            Require(scan.Status == SteamReadStatus.MalformedPage && scan.Value == null,
+                "A conflicting detail and explicit index count produced a partial snapshot.");
+
+            client = new FakeCommunity(SteamReadResult<string>.Succeeded(Page(EmptyDropRow(10))),
+                SteamReadResult<string>.Succeeded(Page(Row(10, "Detail", "No card drops remaining", "2.2 hrs on record"))),
+                SteamReadResult<string>.Succeeded(Page(EmptyDropRow(10))),
+                SteamReadResult<string>.Succeeded(Page(Row(10, "Detail", "4 card drops remaining", "2.2 hrs on record"))));
+            var scanner = new BadgeScanner(client, owned);
+            var zero = await scanner.ScanAsync(Profile, CancellationToken.None);
+            var renewed = await scanner.ScanAsync(Profile, CancellationToken.None);
+            Require(zero.IsSuccess && zero.Value.Single().RemainingCard == 0 && renewed.IsSuccess && renewed.Value.Single().RemainingCard == 4
+                && client.Urls.Count == 4,
+                "A prior zero-count cache hid newly available drops on a later scan.");
+        }
+
+        private static async Task ParallelDetailsAreBoundedAndCancelable()
+        {
+            var owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 1, 2, 3 }));
+            var community = new PendingDetailsCommunity();
+            var scan = new BadgeScanner(community, owned).ScanAsync(Profile, CancellationToken.None);
+            await community.TwoStarted.Task;
+            Require(community.Started == 2 && community.Peak == 2 && !scan.IsCompleted,
+                "Detail checks were serialized or started more than two concurrent requests.");
+            community.Complete(1, SteamReadStatus.Success);
+            await community.ThreeStarted.Task;
+            Require(community.Peak == 2, "The next detail bypassed the two-worker limit.");
+            community.Complete(2, SteamReadStatus.Success); community.Complete(3, SteamReadStatus.Success);
+            var result = await scan;
+            Require(result.IsSuccess && result.Value.Count == 3 && community.InFlight == 0,
+                "Successful parallel details did not yield a complete snapshot.");
+
+            foreach (var failure in new[] { SteamReadStatus.TransientFailure, SteamReadStatus.LoginRequired, SteamReadStatus.MalformedPage })
+            {
+                community = new PendingDetailsCommunity();
+                scan = new BadgeScanner(community, owned).ScanAsync(Profile, CancellationToken.None);
+                await community.TwoStarted.Task;
+                community.Complete(1, failure);
+                result = await scan;
+                Require(result.Status == failure && result.Value == null && community.Started == 2
+                    && community.Cancelled == 1 && community.InFlight == 0,
+                    "A failed detail lost its typed failure, published a partial queue, or left its peer running.");
+            }
+
+            using (var cancel = new CancellationTokenSource())
+            {
+                community = new PendingDetailsCommunity();
+                scan = new BadgeScanner(community, owned).ScanAsync(Profile, cancel.Token);
+                await community.TwoStarted.Task; cancel.Cancel();
+                var cancelled = false;
+                try { await scan; } catch (OperationCanceledException) { cancelled = true; }
+                Require(cancelled && community.Started == 2 && community.Cancelled == 2 && community.InFlight == 0,
+                    "User cancellation was masked as a read failure or left queued detail requests alive.");
+            }
+        }
+
+        private static async Task LargeScanRequestBudgetProof()
+        {
+            var pages = new[] { Page(Enumerable.Range(20, 400).Select(EmptyDropRow).Concat(new[] { EmptyDropRow(10) }).ToArray())
+                .Replace("</body>", "<a class='pagelink' href='?p=3'>3</a></body>"),
+                Page(Enumerable.Range(420, 400).Select(EmptyDropRow).ToArray()),
+                Page(Enumerable.Range(820, 200).Select(EmptyDropRow).ToArray()) };
+            var clock = new FakeSteamRequestClock();
+            var sends = new List<TimeSpan>();
+            var handler = new FakeHandler((request, token) =>
+            {
+                sends.Add(clock.Elapsed);
+                if (request.RequestUri.AbsolutePath.Contains("/gamecards/"))
+                    return Task.FromResult(Ok(Page(Row(10, "Detail", "No card drops remaining", "2.2 hrs on record"))));
+                var page = int.Parse(request.RequestUri.Query.Split('=')[1].Split('&')[0]);
+                return Task.FromResult(Ok(pages[page - 1]));
+            });
+            using (var community = new SteamHttpClient(handler, requestBudget: new SteamRequestBudget(clock)))
+            {
+                var owned = new FakeOwnedGames(SteamReadResult<HashSet<int>>.Succeeded(new HashSet<int> { 10 }));
+                var result = await new BadgeScanner(community, owned).ScanAsync(Profile, CancellationToken.None);
+                Require(result.IsSuccess && result.Value.Count == 1 && result.Value[0].RemainingCard == 0
+                    && handler.Count == 4 && owned.Calls == 1,
+                    "A thousand empty unowned index rows expanded beyond three pages and one owned detail request.");
+                var spacing = sends[1] - sends[0];
+                Require(spacing > TimeSpan.Zero && sends.Skip(1).Select((at, index) => at - sends[index]).All(gap => gap == spacing)
+                    && clock.Elapsed.Ticks == spacing.Ticks * 3,
+                    "Scanner optimization bypassed shared request pacing or introduced extra waits.");
+            }
+        }
+
+        private sealed class PendingDetailsCommunity : ICommunityClient
+        {
+            private readonly object sync = new object();
+            private readonly Dictionary<int, TaskCompletionSource<SteamReadResult<string>>> pending = new Dictionary<int, TaskCompletionSource<SteamReadResult<string>>>();
+            public readonly TaskCompletionSource<bool> TwoStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly TaskCompletionSource<bool> ThreeStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public int Started { get; private set; }
+            public int InFlight { get; private set; }
+            public int Peak { get; private set; }
+            public int Cancelled { get; private set; }
+            public async Task<SteamReadResult<string>> GetAsync(string url, CancellationToken token)
+            {
+                token.ThrowIfCancellationRequested();
+                if (url.Contains("/badges/"))
+                    return SteamReadResult<string>.Succeeded(Page(Enumerable.Range(1, 3).Select(EmptyDropRow).ToArray()));
+                var id = int.Parse(url.Split(new[] { "/gamecards/" }, StringSplitOptions.None)[1].Split('/')[0]);
+                var response = new TaskCompletionSource<SteamReadResult<string>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                lock (sync)
+                {
+                    pending.Add(id, response); Started++; InFlight++; Peak = Math.Max(Peak, InFlight);
+                    if (Started == 2) TwoStarted.TrySetResult(true);
+                    if (Started == 3) ThreeStarted.TrySetResult(true);
+                }
+                using (token.Register(() => { lock (sync) { Cancelled++; response.TrySetCanceled(); } }))
+                {
+                    try { return await response.Task.ConfigureAwait(false); }
+                    finally { lock (sync) InFlight--; }
+                }
+            }
+            public void Complete(int id, SteamReadStatus status)
+            {
+                lock (sync) pending[id].TrySetResult(status == SteamReadStatus.Success
+                    ? SteamReadResult<string>.Succeeded(Page(Row(id, "Detail", "No card drops remaining", "2.2 hrs on record")))
+                    : SteamReadResult<string>.Failed(status, "Synthetic detail failure"));
+            }
         }
 
         private sealed class FakeOwnedGames : IOwnedGamesReader
@@ -348,6 +527,15 @@ namespace IdleMasterExtended.Tests
             }
             using (var client = new SteamHttpClient(new FakeHandler((request, token) => Task.FromResult(Ok("page")))))
                 Require(ReferenceEquals(client.RequestBudget, SteamRequestBudget.Shared), "Production clients did not use the process-wide budget.");
+        }
+
+        private static async Task ProductionSpacingRemainsBounded()
+        {
+            var clock = new FakeSteamRequestClock();
+            var budget = new SteamRequestBudget(clock, minimumSpacing: SteamRequestBudget.Shared.MinimumSpacing);
+            Require(budget.MinimumSpacing == TimeSpan.FromMilliseconds(500), "Production reads must remain paced at two per second.");
+            for (var i = 0; i < 100; i++) await budget.WaitForTurnAsync(CancellationToken.None);
+            Require(clock.Elapsed == TimeSpan.FromMilliseconds(500 * 99), "The production scan budget did not enforce spacing.");
         }
 
         private static async Task RetryAfterUsesMonotonicCooldowns()

@@ -52,6 +52,7 @@ namespace IdleMasterExtended.Tests
             await IdenticalActivityObservationsKeepRequestBudgetAsync();
             await ActivityChangesPreserveScanRetryBudgetAsync();
             await ActivityChangesPreserveHelperRetryBudgetAsync();
+            await ClockDelaySnapshotsTolerateConcurrentCancellationAsync();
             OwnedJobClosesOnlyItsChild();
         }
 
@@ -99,7 +100,7 @@ namespace IdleMasterExtended.Tests
                 await run.StartAsync(games, SteamId, IdleMode.Fast);
                 await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 2, "two preparation deadlines");
                 clock.ShiftWallClock(TimeSpan.FromDays(-1));
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => !factory.IsActive(1) && factory.IsActive(2), "first game reaches two hours");
                 Assert(run.Snapshot.RemainingGames.Count == 2 && run.Snapshot.RemainingGames.Sum(game => game.RemainingCards) == 7,
                     "A preparation threshold cannot invent card drops or remove a queued game.");
@@ -108,9 +109,9 @@ namespace IdleMasterExtended.Tests
                 await Until(() => factory.IsActive(2) && clock.PendingCount == 2, "monotonic budget after clock correction");
                 Assert(factory.StartCount == 2,
                     "Wall-clock changes must not extend, shorten, or restart a preparation budget.");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => factory.ActiveCount == 0 && clock.PendingCount == 1, "second preparation threshold");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => clock.PendingCount == 1 && run.Snapshot.State == IdleRunState.Running,
                     "stale badge hours after preparation");
                 Assert(factory.StartCount == 2 && run.Snapshot.GameplayActive && run.Snapshot.ActiveGames.Count == 0,
@@ -133,9 +134,9 @@ namespace IdleMasterExtended.Tests
                 run.UpdateGameActivity(new int[0], true);
                 await run.StartAsync(games, SteamId, IdleMode.Single);
                 await Until(() => factory.ActiveCount == 1 && clock.PendingCount == 2, "pending scan preparation setup");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => entered && clock.PendingCount == 1, "HTTP scan pending before warmup deadline");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => factory.ActiveCount == 0, "warmup ends while HTTP scan is pending");
                 Assert(!scan.Task.IsCompleted && run.Snapshot.RemainingGames.Single().RemainingCards == 3,
                     "An unresponsive scan cannot leave a game idling beyond the preparation budget.");
@@ -160,11 +161,11 @@ namespace IdleMasterExtended.Tests
                 await Until(() => factory.ActiveCount == 30 && clock.PendingCount == 2, "thirty-game preparation cap");
                 Assert(factory.MaximumActive == 30 && run.Snapshot.RemainingGames.Count == 31,
                     "All modes use at most thirty preparation helpers while additional games remain queued.");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => factory.IsActive(31) && clock.PendingCount == 2, "remaining preparation game");
                 Assert(factory.StartCount == 31 && factory.MaximumActive == 30,
                     "Stale badge data cannot restart the first thirty games instead of preparing the remaining game.");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => factory.ActiveCount == 0, "last preparation game stops");
                 Assert(run.Snapshot.State == IdleRunState.Running && run.Snapshot.RemainingGames.Count == 31,
                     "Completing preparation cannot complete a positive card queue.");
@@ -193,11 +194,11 @@ namespace IdleMasterExtended.Tests
                 await run.StartAsync(games, SteamId, IdleMode.ManyThenOne);
                 await Until(() => factory.Attempts == 2 && clock.PendingCount == 1 && first.IsRunning,
                     "second helper startup pending");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => !first.IsRunning && clock.PendingCount == 1, "first warmup cap during later startup");
                 Assert(!late.Task.IsCompleted && !pendingToken.IsCancellationRequested,
                     "An accepted helper must stop at its own cap while a later helper is still initializing.");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => pendingToken.IsCancellationRequested && run.Snapshot.State == IdleRunState.Running &&
                     clock.PendingCount == 1, "pending helper reaches its conservative warmup cap");
                 Assert(run.Snapshot.ActiveGames.Count == 0 && run.Snapshot.RemainingGames.Count == 2 && factory.Attempts == 2,
@@ -217,7 +218,7 @@ namespace IdleMasterExtended.Tests
             {
                 await run.StartAsync(games, SteamId, IdleMode.Fast);
                 await Until(() => factory.ActiveCount == 2 && clock.PendingCount == 1, "fast pre-game batch");
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => factory.ActiveCount == 0 && clock.PendingCount == 1, "fast pre-game solo gap");
                 run.UpdateGameActivity(new[] { 1 }, true);
                 await Until(() => factory.IsActive(2) && clock.PendingCount == 2, "gameplay interrupts fast solo gap");
@@ -437,7 +438,7 @@ namespace IdleMasterExtended.Tests
                 await run.StartAsync(new[] { game }, SteamId, IdleMode.Single);
                 await Until(() => clock.PendingCount == 1 && factory.ActiveCount == 1, "private retry budget setup");
                 run.UpdatePrivateGames(new[] { 1 });
-                clock.AdvanceNext();
+                await AdvanceNextAsync(clock);
                 await Until(() => scans == 1 && clock.PendingCount == 1 &&
                     run.Snapshot.ReadFailure == SteamReadStatus.TransientFailure, "first private scan retry window");
                 var identity = 100;
@@ -449,17 +450,18 @@ namespace IdleMasterExtended.Tests
                         clock.Advance(TimeSpan.FromSeconds(3));
                         run.UpdateGameActivity(new[] { identity++ }, true);
                         var remaining = TimeSpan.FromSeconds(expectedDelay - elapsed);
-                        await Until(() => clock.PendingCount == 1 && clock.NextDelay == remaining,
+                        await Until(() => clock.HasPendingDelay(1, remaining),
                             "scan backoff retained after changed gameplay observation");
                         Assert(scans == expectedScans,
                             "Changed gameplay IDs cannot turn an all-private retry window into repeated HTTP requests.");
                     }
                     clock.Advance(TimeSpan.FromSeconds(3));
                     run.UpdateGameActivity(new[] { identity++ }, true);
-                    await Until(() => scans == expectedScans + 1 && clock.PendingCount == 1,
+                    await Until(() => scans == expectedScans + 1 && clock.HasPendingDelay(1,
+                        TimeSpan.FromSeconds(expectedDelay * 2)),
                         "scan retry at its original monotonic deadline");
                 }
-                Assert(scans == 3 && clock.NextDelay == TimeSpan.FromSeconds(120) &&
+                Assert(scans == 3 && clock.HasPendingDelay(1, TimeSpan.FromSeconds(120)) &&
                     run.Snapshot.State == IdleRunState.Running && game.RemainingCards == 3,
                     "Interrupted retry invocations preserve failure escalation and cannot claim card completion.");
                 await run.StopAsync();
@@ -487,17 +489,16 @@ namespace IdleMasterExtended.Tests
                 for (var failure = 1; failure <= retryDelays.Length; failure++)
                 {
                     var expectedAttempts = failure;
-                    await Until(() => factory.Attempts == expectedAttempts && clock.PendingCount == 1,
-                        "helper retry budget " + failure);
                     var remainingSeconds = retryDelays[failure - 1];
-                    Assert(clock.NextDelay == TimeSpan.FromSeconds(remainingSeconds), "Helper retries retain their escalating delay.");
+                    await Until(() => factory.Attempts == expectedAttempts && clock.HasPendingDelay(1,
+                        TimeSpan.FromSeconds(remainingSeconds)), "helper retry budget " + failure);
                     while (remainingSeconds > 3)
                     {
                         clock.Advance(TimeSpan.FromSeconds(3));
                         remainingSeconds -= 3;
                         run.UpdateGameActivity(new[] { identity++ }, true);
                         var remaining = TimeSpan.FromSeconds(remainingSeconds);
-                        await Until(() => clock.PendingCount == 1 && clock.NextDelay == remaining,
+                        await Until(() => clock.HasPendingDelay(1, remaining),
                             "helper deadline retained after gameplay change");
                         Assert(factory.Attempts == expectedAttempts,
                             "Gameplay changes cannot bypass the helper initialization backoff.");
@@ -510,6 +511,43 @@ namespace IdleMasterExtended.Tests
                 Assert(scans == 0 && factory.ActiveCount == 0 && clock.PendingCount == 0 &&
                     run.Snapshot.RemainingGames.Single().RemainingCards == 2,
                     "Activity changes cannot reset initialization failure limits, consume HTTP budget, or discard counts.");
+            }
+        }
+
+        private static async Task ClockDelaySnapshotsTolerateConcurrentCancellationAsync()
+        {
+            var clock = new AdvancingClock();
+            for (var iteration = 0; iteration < 128; iteration++)
+            {
+                using (var cancellation = new CancellationTokenSource())
+                using (var startTogether = new Barrier(2))
+                {
+                    var delay = clock.DelayAsync(TimeSpan.FromSeconds(30), cancellation.Token);
+                    var before = clock.ReadDelays();
+                    Assert(before.PendingCount == 1 && before.NextDelay == TimeSpan.FromSeconds(30),
+                        "A delay snapshot must capture its count and deadline together.");
+                    var cancel = Task.Run(() =>
+                    {
+                        startTogether.SignalAndWait();
+                        cancellation.Cancel();
+                    });
+                    var observe = Task.Run(() =>
+                    {
+                        startTogether.SignalAndWait();
+                        for (var read = 0; read < 16; read++)
+                        {
+                            var current = clock.ReadDelays();
+                            Assert(current.PendingCount <= 1 &&
+                                ((current.PendingCount == 0) == !current.NextDelay.HasValue),
+                                "Concurrent cancellation must yield a coherent populated or empty clock snapshot.");
+                        }
+                    });
+                    await Task.WhenAll(cancel, observe);
+                    var after = clock.ReadDelays();
+                    Assert(delay.IsCanceled && after.PendingCount == 0 && !after.NextDelay.HasValue &&
+                        !clock.HasPendingDelay(1, TimeSpan.FromSeconds(30)) && !clock.TryAdvanceNext(),
+                        "A canceled delay leaves a valid empty snapshot and an unsettled predicate, without throwing.");
+                }
             }
         }
 
@@ -1209,6 +1247,13 @@ namespace IdleMasterExtended.Tests
             }
         }
 
+        private static Task AdvanceNextAsync(AdvancingClock clock)
+        {
+            // Cancellation and replacement of a controller phase can temporarily
+            // leave no delay. Advance only once the next phase has scheduled one.
+            return Until(() => clock.TryAdvanceNext(), "the next scheduled clock delay");
+        }
+
         private static void Assert(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
@@ -1259,9 +1304,25 @@ namespace IdleMasterExtended.Tests
             public DateTimeOffset UtcNow { get { lock (sync) return now.Add(wallOffset); } }
             public TimeSpan Elapsed
             { get { lock (sync) return now - new DateTimeOffset(2026, 10, 10, 0, 0, 0, TimeSpan.Zero); } }
-            public int PendingCount { get { lock (sync) return delays.Count(delay => !delay.Source.Task.IsCompleted); } }
-            public TimeSpan NextDelay
-            { get { lock (sync) return delays.Where(delay => !delay.Source.Task.IsCompleted).Min(delay => delay.Due) - now; } }
+            public int PendingCount { get { return ReadDelays().PendingCount; } }
+
+            public DelaySnapshot ReadDelays()
+            {
+                lock (sync)
+                {
+                    // Capture the same pending set for both fields. A policy change
+                    // may cancel the last delay between two independent property reads.
+                    var pending = delays.Where(delay => !delay.Source.Task.IsCompleted).ToList();
+                    return new DelaySnapshot(pending.Count, pending.Count == 0 ? (TimeSpan?)null :
+                        pending.Min(delay => delay.Due) - now);
+                }
+            }
+
+            public bool HasPendingDelay(int count, TimeSpan duration)
+            {
+                var snapshot = ReadDelays();
+                return snapshot.PendingCount == count && snapshot.NextDelay == duration;
+            }
 
             public Task DelayAsync(TimeSpan duration, CancellationToken token)
             {
@@ -1272,17 +1333,20 @@ namespace IdleMasterExtended.Tests
                         Source = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
                     delays.Add(delay);
                 }
-                token.Register(() => delay.Source.TrySetCanceled());
+                token.Register(() => { lock (sync) delay.Source.TrySetCanceled(); });
                 return delay.Source.Task;
             }
 
-            public void AdvanceNext()
+            public bool TryAdvanceNext()
             {
                 lock (sync)
                 {
-                    now = delays.Where(delay => !delay.Source.Task.IsCompleted).Min(delay => delay.Due);
-                    foreach (var delay in delays.Where(delay => !delay.Source.Task.IsCompleted && delay.Due <= now))
+                    var pending = delays.Where(delay => !delay.Source.Task.IsCompleted).ToList();
+                    if (pending.Count == 0) return false;
+                    now = pending.Min(delay => delay.Due);
+                    foreach (var delay in pending.Where(delay => delay.Due <= now))
                         delay.Source.TrySetResult(true);
+                    return true;
                 }
             }
 
@@ -1302,6 +1366,18 @@ namespace IdleMasterExtended.Tests
             {
                 public DateTimeOffset Due;
                 public TaskCompletionSource<bool> Source;
+            }
+
+            public sealed class DelaySnapshot
+            {
+                public int PendingCount { get; private set; }
+                public TimeSpan? NextDelay { get; private set; }
+
+                public DelaySnapshot(int pendingCount, TimeSpan? nextDelay)
+                {
+                    PendingCount = pendingCount;
+                    NextDelay = nextDelay;
+                }
             }
         }
 

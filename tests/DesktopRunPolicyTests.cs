@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Reflection;
@@ -61,6 +61,27 @@ namespace IdleMasterExtended.Tests
                 Test.Assert(Field<ListView>(form, "GamesState").Items.Count == 1, "Foreground return applies the deferred card list.");
                 Test.Assert(!form.Visible && !form.Focused, "Applying background state must not activate or reveal the app.");
                 Test.Assert(!Field<SteamSessionService>(form, "session").IsInitialized, "Background UI tests must never open Steam sign-in.");
+                Set(form, "busy", true); Set(form, "canCancelScan", true);
+                Set(form, "scanInProgress", true); Set(form, "scanGeneration", 3);
+                Invoke(form, "UpdateButtons");
+                Test.Assert(Field<Button>(form, "btnRefresh").Enabled && !Field<Button>(form, "btnStart").Enabled,
+                    "Pending scans expose Cancel while Start remains disabled.");
+                form.ReportScanProgress(new BadgeScanProgress(BadgeScanStage.GameDetails, 12, 40), 3, CancellationToken.None);
+                var progress = Field<LinkLabel>(form, "lblCurrentStatus").Text;
+                Test.Assert(progress.Contains("12") && progress.Contains("40"), "Detail progress shows completed and total reads.");
+                form.ReportScanProgress(new BadgeScanProgress(BadgeScanStage.GameDetails, 30, 40), 2, CancellationToken.None);
+                Test.Assert(Field<LinkLabel>(form, "lblCurrentStatus").Text == progress, "Progress from an older scan cannot overwrite current state.");
+                using (var canceled = new CancellationTokenSource())
+                {
+                    canceled.Cancel();
+                    form.ReportScanProgress(new BadgeScanProgress(BadgeScanStage.GameDetails, 30, 40), 3, canceled.Token);
+                    Test.Assert(Field<LinkLabel>(form, "lblCurrentStatus").Text == progress, "Canceled reads cannot publish queued progress.");
+                }
+                Set(form, "scanInProgress", false); Set(form, "canCancelScan", false); Set(form, "busy", false);
+                form.ReportScanProgress(new BadgeScanProgress(BadgeScanStage.GameDetails, 40, 40), 3, CancellationToken.None);
+                Test.Assert(Field<LinkLabel>(form, "lblCurrentStatus").Text == progress && !form.Visible && !form.Focused,
+                    "Late progress after completion cannot replace state, reveal the window or take focus.");
+
                 Field<SteamActivityMonitor>(form, "steamActivity").Dispose();
                 Field<System.Windows.Forms.Timer>(form, "displayTimer").Dispose();
                 Field<CancellationTokenSource>(form, "lifetime").Cancel();
@@ -72,6 +93,7 @@ namespace IdleMasterExtended.Tests
                 Field<System.Drawing.Image>(form, "darkFalse").Dispose();
             }
         }
+        private static void Set(frmMain form, string name, object value) => typeof(frmMain).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, value);
         private static T Field<T>(frmMain form, string name) => (T)typeof(frmMain)
             .GetField(name, BindingFlags.NonPublic | BindingFlags.Instance).GetValue(form);
         private static void Invoke(frmMain form, string name) => typeof(frmMain)

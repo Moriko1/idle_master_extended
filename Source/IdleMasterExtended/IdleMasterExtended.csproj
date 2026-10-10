@@ -177,7 +177,10 @@
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <Target Name="CopyPortableDependencies" AfterTargets="Build">
     <Copy SourceFiles="$(MSBuildProjectDirectory)\..\..\Dependencies\steam_api64.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\..\..\steam-idle Source\steam-idle\bin\x64\$(Configuration)\steam-idle.exe;$(MSBuildProjectDirectory)\..\..\steam-idle Source\steam-idle\bin\x64\$(Configuration)\steam-idle.exe.config" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+    <MSBuild Projects="$(MSBuildProjectDirectory)\..\..\steam-idle Source\steam-idle\steam-idle.csproj" Targets="GetTargetPath" Properties="Configuration=$(Configuration);Platform=$(Platform)">
+      <Output TaskParameter="TargetOutputs" ItemName="IdleHelperOutputs" />
+    </MSBuild>
+    <Copy SourceFiles="@(IdleHelperOutputs);@(IdleHelperOutputs-&gt;'%(Identity).config')" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="'@(IdleHelperOutputs)' != ''" />
     <ItemGroup>
       <LanguageAssemblies Include="$(TargetDir)**\IdleMasterExtended.resources.dll" Exclude="$(TargetDir)Languages\**\*" />
     </ItemGroup>

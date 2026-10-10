@@ -37,10 +37,11 @@ namespace IdleMasterExtended
 
         public async Task<SteamReadResult<GameQueueSnapshot>> ReadAsync(string profileUrl,
             IEnumerable<string> whitelist, CancellationToken cancellationToken,
-            Func<HashSet<int>, Task> privacyVerified = null)
+            Func<HashSet<int>, Task> privacyVerified = null, Action<BadgeScanProgress> progress = null)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var whitelistSnapshot = whitelist?.ToList();
+            BadgeScanner.ReportProgress(progress, BadgeScanStage.PrivateGames, 0, 1);
             var privacy = await privateGames.ReadPrivateAsync(profileUrl, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (!privacy.IsSuccess)
@@ -48,6 +49,7 @@ namespace IdleMasterExtended
             if (privacy.Value == null || privacy.Value.Any(appId => appId <= 0))
                 return SteamReadResult<GameQueueSnapshot>.Failed(SteamReadStatus.MalformedPage,
                     "Steam's private game list could not be verified. Your previous game list has been kept.");
+            BadgeScanner.ReportProgress(progress, BadgeScanStage.PrivateGames, 1, 1);
             // Copy before further asynchronous reads; never edit the reader's set or
             // allow a later input mutation to change the queue's privacy evidence.
             var privateAppIds = new HashSet<int>(privacy.Value);
@@ -62,7 +64,7 @@ namespace IdleMasterExtended
             if (whitelistSnapshot == null)
             {
                 var read = await new BadgeScanner(community, ownedGames, privateAppIds)
-                    .ScanAsync(profileUrl, cancellationToken).ConfigureAwait(false);
+                    .ScanAsync(profileUrl, cancellationToken, progress).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!read.IsSuccess)
                     return SteamReadResult<GameQueueSnapshot>.Failed(read.Status, read.Message);

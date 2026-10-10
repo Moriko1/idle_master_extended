@@ -42,13 +42,16 @@ namespace IdleMasterExtended
         private TimeSpan nextSend;
         private TimeSpan cooldown;
 
-        public static SteamRequestBudget Shared { get; } = new SteamRequestBudget(new SystemClock(), RecordDiagnostic);
+        public static SteamRequestBudget Shared { get; } = new SteamRequestBudget(new SystemClock(), RecordDiagnostic, TimeSpan.FromMilliseconds(500));
+        public TimeSpan MinimumSpacing { get; }
 
         // Isolated clocks/budgets make tests deterministic without contacting Steam or sleeping.
-        public SteamRequestBudget(ISteamRequestClock clock, Action<SteamRequestDiagnostic> diagnostic = null)
+        public SteamRequestBudget(ISteamRequestClock clock, Action<SteamRequestDiagnostic> diagnostic = null, TimeSpan? minimumSpacing = null)
         {
             this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
             this.diagnostic = diagnostic;
+            MinimumSpacing = minimumSpacing ?? TimeSpan.FromSeconds(1);
+            if (MinimumSpacing < TimeSpan.Zero || MinimumSpacing > TimeSpan.FromSeconds(10)) throw new ArgumentOutOfRangeException(nameof(minimumSpacing));
         }
 
         public async Task WaitForTurnAsync(CancellationToken cancellationToken)
@@ -66,7 +69,7 @@ namespace IdleMasterExtended
                         var due = nextSend > cooldown ? nextSend : cooldown;
                         if (due <= now)
                         {
-                            nextSend = Add(now, TimeSpan.FromSeconds(1));
+                            nextSend = Add(now, MinimumSpacing);
                             return;
                         }
                         delay = due - now;

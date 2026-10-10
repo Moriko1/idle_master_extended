@@ -23,6 +23,10 @@ namespace IdleMasterExtended.Tests
             await IncompleteAndErrorRepliesAreRejected();
             await ApiFailuresPreserveTheVerifiedSession();
             await CommunityAndApiReadsShareTheBudget();
+            await SuccessfulProofIsSharedButApiResultsStayFresh();
+            await CacheIsAccountBoundAndFailuresAreNotCached();
+            await RejectedApiTokenRequiresFreshProof();
+            await ConcurrentReadersFetchOneProof();
             await ApiCancellationPropagates();
         }
 
@@ -62,16 +66,119 @@ namespace IdleMasterExtended.Tests
                         return Task.FromResult(response);
                     }
                     return Task.FromResult(Reply("{\"response\":{\"private_apps\":{}}}"));
-                }));
+                }), elapsed: () => clock.Elapsed);
                 var first = await reader.ReadAsync(Profile, CancellationToken.None);
                 Require(first.Status == SteamReadStatus.TransientFailure && first.Value == null && apiCalls == 1,
                     "A failed library API read published ownership data or retried internally.");
                 var second = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
                 Require(second.IsSuccess && second.Value.Count == 0, "A later privacy read could not recover using refreshed session proof.");
             }
-            Require(sends.SequenceEqual(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(126), TimeSpan.FromSeconds(127) }),
+            Require(sends.SequenceEqual(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(127), TimeSpan.FromSeconds(128) }),
                 "Community, owned and private reads failed to share spacing and a longer API Retry-After cooldown.");
         }
+
+        private static async Task SuccessfulProofIsSharedButApiResultsStayFresh()
+        {
+            var age = TimeSpan.Zero;
+            var community = new FakeCommunity(Page(Proof()));
+            var apiCalls = 0;
+            var reader = new OwnedGamesReader(community, () => new ApiHandler((request, token) =>
+            {
+                apiCalls++;
+                return Task.FromResult(ApiListReply(request));
+            }), CommunityReadTests.NewBudget(), () => age);
+            Require((await reader.ReadPrivateAsync(Profile, CancellationToken.None)).IsSuccess, "The initial privacy proof failed.");
+            Require((await reader.ReadAsync(Profile + "/", CancellationToken.None)).IsSuccess, "Canonical-account proof could not serve the ownership read.");
+            Require((await reader.ReadPrivateAsync(Profile, CancellationToken.None)).IsSuccess, "Repeated privacy verification failed.");
+            age = TimeSpan.FromSeconds(119);
+            Require((await reader.ReadAsync(Profile, CancellationToken.None)).IsSuccess, "A still-fresh ownership proof failed.");
+            Require(community.ReadCount == 1 && apiCalls == 4,
+                "Fresh SSR proof was downloaded again or an API privacy/ownership result was cached.");
+            age = TimeSpan.FromMinutes(2);
+            Require((await reader.ReadPrivateAsync(Profile, CancellationToken.None)).IsSuccess && community.ReadCount == 2 && apiCalls == 5,
+                "Proof older than two monotonic minutes was reused.");
+        }
+
+        private static async Task CacheIsAccountBoundAndFailuresAreNotCached()
+        {
+            var community = new FakeCommunity(Page(Proof()));
+            var calls = 0;
+            var reader = new OwnedGamesReader(community, () => new ApiHandler((request, token) =>
+            {
+                calls++;
+                return Task.FromResult(ApiListReply(request));
+            }), CommunityReadTests.NewBudget());
+            Require((await reader.ReadAsync(Profile, CancellationToken.None)).IsSuccess, "Initial account proof failed.");
+            var different = Proof();
+            var otherId = "76561198000000002";
+            ((Dictionary<string, object>)different["UserConfig"])["steamid"] = otherId;
+            ChangeLoader(different, 0, loader => loader["steamid"] = otherId);
+            ChangeLoader(different, 1, loader => loader["steamid"] = otherId);
+            community.Response = () => SteamReadResult<string>.Succeeded(Page(different));
+            Require((await reader.ReadPrivateAsync("https://steamcommunity.com/profiles/" + otherId, CancellationToken.None)).IsSuccess
+                && community.ReadCount == 2 && calls == 2, "A different account inherited cached SSR proof.");
+            foreach (var status in new[] { SteamReadStatus.TransientFailure, SteamReadStatus.MalformedPage, SteamReadStatus.LoginRequired })
+            {
+                community = new FakeCommunity(Page(Proof())) { Response = () => SteamReadResult<string>.Failed(status, "Synthetic failure") };
+                var handler = new ApiHandler((request, token) => Task.FromResult(ApiListReply(request)));
+                reader = new OwnedGamesReader(community, () => handler, CommunityReadTests.NewBudget());
+                var first = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
+                Require(first.Status == status && handler.Calls == 0, "Failed Community proof sent an API token.");
+                community.Response = null;
+                var second = await reader.ReadAsync(Profile, CancellationToken.None);
+                Require(second.IsSuccess && community.ReadCount == 2 && handler.Calls == 1,
+                    "A transient, malformed or logged-out Community result was cached.");
+            }
+            community = new FakeCommunity(Page(Proof()))
+                { Response = () => SteamReadResult<string>.Succeeded("<html>Unexpected SSR layout</html>") };
+            var malformedHandler = new ApiHandler((request, token) => Task.FromResult(ApiListReply(request)));
+            reader = new OwnedGamesReader(community, () => malformedHandler, CommunityReadTests.NewBudget());
+            Require((await reader.ReadPrivateAsync(Profile, CancellationToken.None)).Status == SteamReadStatus.MalformedPage
+                && malformedHandler.Calls == 0, "Malformed successful HTML supplied cached session proof.");
+            community.Response = null;
+            Require((await reader.ReadAsync(Profile, CancellationToken.None)).IsSuccess && community.ReadCount == 2,
+                "Malformed successful HTML was cached instead of reading a corrected SSR page.");
+        }
+
+        private static async Task RejectedApiTokenRequiresFreshProof()
+        {
+            var community = new FakeCommunity(Page(Proof()));
+            var calls = 0;
+            var reader = new OwnedGamesReader(community, () => new ApiHandler((request, token) =>
+            {
+                calls++;
+                return Task.FromResult(calls == 1 ? new HttpResponseMessage(HttpStatusCode.Unauthorized) : ApiListReply(request));
+            }), CommunityReadTests.NewBudget());
+            var first = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
+            Require(first.Status == SteamReadStatus.TransientFailure && first.Value == null && community.ReadCount == 1 && calls == 1,
+                "An API token rejection lost saved login or retried internally.");
+            Require((await reader.ReadAsync(Profile, CancellationToken.None)).IsSuccess && community.ReadCount == 2 && calls == 2,
+                "An API-rejected token survived in the SSR proof cache.");
+        }
+
+        private static async Task ConcurrentReadersFetchOneProof()
+        {
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var community = new FakeCommunity(Page(Proof())) { BeforeRead = token => release.Task };
+            var calls = 0;
+            var reader = new OwnedGamesReader(community, () => new ApiHandler((request, token) =>
+            {
+                Interlocked.Increment(ref calls);
+                return Task.FromResult(ApiListReply(request));
+            }), CommunityReadTests.NewBudget());
+            var privacy = reader.ReadPrivateAsync(Profile, CancellationToken.None);
+            var owned = reader.ReadAsync(Profile, CancellationToken.None);
+            Require(community.ReadCount == 1 && calls == 0, "Concurrent readers launched duplicate SSR requests.");
+            release.TrySetResult(true);
+            var reads = await Task.WhenAll(privacy, owned);
+            Require(reads.All(read => read.IsSuccess) && community.ReadCount == 1 && calls == 2,
+                "Serialized proof retrieval lost a fresh API read or duplicated the SSR page.");
+        }
+
+        private static HttpResponseMessage ApiListReply(HttpRequestMessage request) =>
+            Reply(request.RequestUri.AbsolutePath.Contains("GetPrivateAppList")
+                ? "{\"response\":{\"private_apps\":{}}}"
+                : "{\"response\":{\"game_count\":0,\"games\":[]}}");
 
         private static async Task InclusiveRequestAndFamilyCountsAreVerified()
         {
@@ -85,7 +192,9 @@ namespace IdleMasterExtended.Tests
                 var input = Json().Deserialize<Dictionary<string, object>>(Query(request.RequestUri, "input_json"));
                 Require((string)input["steamid"] == SteamId && Query(request.RequestUri, "access_token") == Token,
                     "The request did not use the verified profile and template token.");
-                foreach (var flag in new[] { "include_appinfo", "include_free_sub", "include_played_free_games", "include_family_licenses" })
+                Require(input.ContainsKey("include_appinfo") && input["include_appinfo"] is bool && !(bool)input["include_appinfo"],
+                    "Ownership unnecessarily requested unused application metadata.");
+                foreach (var flag in new[] { "include_free_sub", "include_played_free_games", "include_family_licenses" })
                     Require(input.ContainsKey(flag) && input[flag] is bool && (bool)input[flag], "An ownership inclusion flag was omitted.");
                 Require(input.ContainsKey("skip_unvetted_apps") && !(bool)input["skip_unvetted_apps"]
                     && !input.ContainsKey("appids_filter"), "The owned library was filtered.");
@@ -234,14 +343,20 @@ namespace IdleMasterExtended.Tests
         {
             private readonly string html;
             public int RequestedLimit { get; private set; }
+            public int ReadCount { get; private set; }
+            public Func<SteamReadResult<string>> Response { get; set; }
+            public Func<CancellationToken, Task> BeforeRead { get; set; }
             public FakeCommunity(string html) { this.html = html; }
             public Task<SteamReadResult<string>> GetAsync(string url, CancellationToken token) =>
                 GetAsync(url, SteamHttpClient.DefaultResponseLimit, token);
-            public Task<SteamReadResult<string>> GetAsync(string url, int maximumResponseBytes, CancellationToken token)
+            public async Task<SteamReadResult<string>> GetAsync(string url, int maximumResponseBytes, CancellationToken token)
             {
                 token.ThrowIfCancellationRequested();
                 RequestedLimit = maximumResponseBytes;
-                return Task.FromResult(SteamReadResult<string>.Succeeded(html));
+                ReadCount++;
+                if (BeforeRead != null) await BeforeRead(token);
+                token.ThrowIfCancellationRequested();
+                return Response?.Invoke() ?? SteamReadResult<string>.Succeeded(html);
             }
         }
 

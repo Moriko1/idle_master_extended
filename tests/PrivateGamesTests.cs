@@ -29,6 +29,7 @@ namespace IdleMasterExtended.Tests
         private static async Task AuthenticatedReadUsesAnEmptyRequest()
         {
             var community = new FakeCommunity(Page(Proof()));
+            var apiReads = 0;
             var handler = new ApiHandler((request, token) =>
             {
                 Require(request.Method == HttpMethod.Get && request.RequestUri.Scheme == "https"
@@ -41,13 +42,19 @@ namespace IdleMasterExtended.Tests
                 Require(input.Count == 0 && Query(request.RequestUri, "steamid") == null
                     && Query(request.RequestUri, "access_token") == Token,
                     "The private-game request did not use the account-scoped empty-request contract.");
-                return Task.FromResult(Reply("{\"response\":{\"private_apps\":{\"appids\":[10,20]}}}"));
+                apiReads++;
+                return Task.FromResult(Reply(apiReads == 1 ? "{\"response\":{\"private_apps\":{\"appids\":[10,20]}}}"
+                    : "{\"response\":{\"private_apps\":{\"appids\":[20]}}}"));
             });
-            var read = await Reader(community, handler).ReadPrivateAsync(Profile, CancellationToken.None);
+            var reader = Reader(community, handler);
+            var read = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
             Require(read.IsSuccess && read.Value.SetEquals(new[] { 10, 20 }) && handler.Calls == 1,
                 "The authenticated private-app list was lost or duplicated.");
             Require(community.RequestedLimit == SteamHttpClient.MaximumResponseLimit,
                 "The privacy reader did not retain the bounded large SSR response path.");
+            read = await reader.ReadPrivateAsync(Profile, CancellationToken.None);
+            Require(read.IsSuccess && read.Value.SetEquals(new[] { 20 }) && handler.Calls == 2 && community.ReadCount == 1,
+                "Reusing recent SSR proof cached an old private-app result or fetched the large page again.");
             foreach (var body in new[] { "{\"response\":{\"private_apps\":{\"appids\":[]}}}", "{\"response\":{\"private_apps\":{}}}" })
             {
                 read = await ReadApi(body);
@@ -234,6 +241,7 @@ namespace IdleMasterExtended.Tests
         {
             private readonly string html;
             public int RequestedLimit { get; private set; }
+            public int ReadCount { get; private set; }
             public FakeCommunity(string html) { this.html = html; }
             public Task<SteamReadResult<string>> GetAsync(string url, CancellationToken token) =>
                 GetAsync(url, SteamHttpClient.DefaultResponseLimit, token);
@@ -241,6 +249,7 @@ namespace IdleMasterExtended.Tests
             {
                 token.ThrowIfCancellationRequested();
                 RequestedLimit = maximumResponseBytes;
+                ReadCount++;
                 return Task.FromResult(SteamReadResult<string>.Succeeded(html));
             }
         }

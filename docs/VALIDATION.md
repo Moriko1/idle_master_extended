@@ -1,6 +1,20 @@
-# Prerelease validation: 1.12.0-preview.6
+# Prerelease validation: 1.12.0-preview.7
 
 Validation performed on the Windows development host for the corrected Moriko1 prerelease.
+
+## Scan performance and responsiveness in preview.7
+
+The user reported that card checks took about ten minutes but eventually completed. Code review found avoidable per-game requests: ownership was checked only after a failed detail read, and duplicate blank badge rows could request the same detail repeatedly. Preview.7 verifies complete ownership when the first recognized empty index row needs it, excludes only games proven absent, and collects every badge page before resolving unique owned-game details. Unknown or malformed counts never become zero, conflicting duplicate counts fail the atomic scan, and no prior zero-drop detail result is reused across scans.
+
+Fresh detail reads use exactly two asynchronous workers and retain the shared production spacing of at least 500 ms between Community/library sends. HTTP 429 still imposes at least 60 seconds of cooldown, HTTP 403 at least 30 seconds, and longer valid Retry-After delays remain authoritative. The first detail failure cancels its outstanding peer and returns the original typed failure; user cancellation stays cancellation. The previous card snapshot remains visible until a complete successful replacement. Page and detail progress, plus **Cancel scan**, make the current work visible. Large libraries with many owned games whose index counts are blank still require fresh detail requests and can take time.
+
+Verified same-account games-page proof and its in-memory token can be reused for up to two minutes by the ownership/privacy reader; owned and private API results are always read fresh. Account changes, expiry and token rejection invalidate proof, and a long server cooldown requires fresh proof before the API send. A new **Start** may reuse a complete queue from the last two minutes only after a fresh matching private-game list and unchanged scan inputs. A changed privacy list or scan source requires a full scan. Manual **Resume** and **Refresh** always scan fully. Canceling Settings or an unfinished sign-in does not initiate an additional scan or verification request. Saved appearance, ordering and blacklist changes can be applied locally; changing the scan source requires a full scan.
+
+Browser initialization, cookie reads, remembered-login navigation and profile cleanup have cancellable deadlines. Account-page DOM parsing runs off the UI thread. Aggregate `Logs\scans.log` records outcome, elapsed milliseconds, completed badge pages and detail counts; it never records accounts, game names/IDs, URLs, cookies, tokens or HTML. Diagnostics write asynchronously and cannot delay scan completion.
+
+Both x64 Release executables build with no compiler warnings/errors and all 12 local regression suites pass. New synthetic coverage proves that 1,000 unowned blank index rows cause zero card-detail requests; a three-page fixture with those rows plus one owned blank row requires only three badge requests and one detail request, while retaining shared pacing. Tests cover duplicate detail reads across pages, conflicting counts/hours, later-page failure before detail traffic, a zero-to-positive count on a later scan, at most two in-flight details, peer cancellation with typed failures, and user cancellation. Additional fake-clock/response/form cases cover short-lived proof reuse with fresh APIs, request spacing/cooldowns, short-lived queue reuse, privacy changes, source/settings changes, Cancel without extra requests, progress and browser deadlines. All 60 synthetic light/dark DPI PNG renders pass their geometry checks; actual monitor DPI changes were not performed.
+
+At the time this source validation report was prepared, no real preview.7 scan duration or sustained-idling performance had been measured. Any completed live startup timing is reported separately in the release notes. These request-count and timing checks are deterministic synthetic evidence, not a live speed comparison. Real expired-session renewal also remains unverified. The preview.6 identity-only check and earlier card scans below are historical evidence for their named builds; they do not establish preview.7 scan speed or card drops.
 
 ## Sign-in and request-budget fixes in preview.6
 

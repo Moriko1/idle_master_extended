@@ -19,6 +19,13 @@ namespace IdleMasterExtended
         public List<Badge> AllBadges { get; private set; } = new List<Badge>();
         public Badge CurrentBadge { get; private set; }
         private readonly SteamSessionService session = new SteamSessionService();
+        private readonly ScanReusePolicy scanReuse = new ScanReusePolicy();
+        private List<Badge> scannedBadges;
+        private OwnedGamesReader libraryReader;
+        private SteamHttpClient libraryClient;
+        private int scanGeneration;
+        private bool scanInProgress;
+        private volatile bool canCancelScan;
         private readonly Func<bool> testSteamClientProbe;
         private readonly SteamActivityMonitor steamActivity = new SteamActivityMonitor();
         private readonly SteamClientLossPolicy clientLoss = new SteamClientLossPolicy();
@@ -103,7 +110,7 @@ namespace IdleMasterExtended
             btnPause.Text = UiText.Get("pause"); btnPause.Image = null; btnPause.Location = new Point(90, 202); btnPause.Size = new Size(70, 28);
             btnSkip.Text = UiText.Get("skip"); btnSkip.Image = null; btnSkip.Location = new Point(165, 202); btnSkip.Size = new Size(70, 28);
             btnRefresh.Text = UiText.Get("refresh"); btnRefresh.Location = new Point(315, 202); btnRefresh.Size = new Size(70, 28);
-            btnRefresh.Click += async (s, e) => await RefreshManuallyAsync();
+            btnRefresh.Click += async (s, e) => { if (canCancelScan) scanCancellation?.Cancel(); else await RefreshManuallyAsync(); };
             Controls.Add(btnRefresh);
             btnStop.Text = UiText.Get("stop"); btnStop.Location = new Point(240, 202); btnStop.Size = new Size(70, 28);
             btnStop.Click += async (sender, args) => await StopSessionAsync();
@@ -154,9 +161,11 @@ namespace IdleMasterExtended
                 try
                 {
                     CoreWebView2Environment.GetAvailableBrowserVersionString();
-                    await session.InitializeAsync(browser);
+                    await session.InitializeAsync(browser, lifetime.Token);
+                    if (closing || IsDisposed) return;
                     await RefreshManuallyAsync();
                 }
+                catch (OperationCanceledException) when (closing || lifetime.IsCancellationRequested) { return; }
                 catch (WebView2RuntimeNotFoundException)
                 {
                     SetMessage(UiText.Get("webview_missing"));
@@ -202,6 +211,17 @@ namespace IdleMasterExtended
             Settings.Default.OneThenMany ? IdleMode.OneThenMany : IdleMode.ManyThenOne;
         private bool Running => runStatus?.State == IdleRunState.Running || runStatus?.State == IdleRunState.Starting;
         private IdleMode EffectiveMode => sessionTracker.Active ? runMode : SelectedMode;
+        private QueueSettingsSnapshot CaptureQueueSettings() => new QueueSettingsSnapshot(
+            Settings.Default.IdlingModeWhitelist, Settings.Default.fastMode, Settings.Default.OnlyOneGameIdle,
+            Settings.Default.OneThenMany, Settings.Default.IdleOnlyPlayed, Settings.Default.sort,
+            (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>(),
+            (Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
+        private void ApplyQueueSort(string sort)
+        {
+            var badges = scannedBadges ?? AllBadges;
+            AllBadges = sort == "mostcards" ? badges.OrderByDescending(b => b.RemainingCard).ToList() :
+                sort == "leastcards" ? badges.OrderBy(b => b.RemainingCard).ToList() : badges.ToList();
+        }
         private List<IdleGame> GamesForRun()
         {
             var mode = EffectiveMode;
@@ -214,19 +234,28 @@ namespace IdleMasterExtended
         }
         private async Task<SteamReadResult<List<Badge>>> ScanAsync(CancellationToken token, bool forRun)
         {
+            // A canceled, partial, or failed refresh must never make an older scan reusable.
+            scanReuse.Invalidate();
             await scanGate.WaitAsync(token);
+            var generation = ++scanGeneration;
+            scanInProgress = true;
+            var diagnostic = new ScanDiagnostics();
+            SteamReadStatus? outcome = null;
+            Action<BadgeScanProgress> progress = value => { diagnostic.Observe(value); ReportScanProgress(value, generation, token); };
             try
             {
                 var login = await session.ValidateAsync(token);
                 if (!login.IsSuccess)
                 {
                     if (login.Status == SteamReadStatus.LoginRequired) authenticated = false; lastFailure = login.Status;
+                    outcome = login.Status;
                     return SteamReadResult<List<Badge>>.Failed(login.Status, login.Message);
                 }
                 authenticated = true;
                 if (forRun && login.Value.SteamId != runSteamId)
                 {
                     authenticated = false; lastFailure = SteamReadStatus.LoginRequired;
+                    outcome = SteamReadStatus.LoginRequired;
                     return SteamReadResult<List<Badge>>.Failed(SteamReadStatus.LoginRequired, UiText.Get("account_changed"));
                 }
                 var whitelist = (forRun ? runMode : SelectedMode) == IdleMode.Whitelist
@@ -234,14 +263,14 @@ namespace IdleMasterExtended
                     : null;
                 Func<Task<SteamReadResult<GameQueueSnapshot>>> readQueue = () =>
                 {
-                    var library = new OwnedGamesReader(session.Client);
+                    var library = GetLibraryReader();
                     return new GameQueueScanner(session.Client, library, library)
                         .ReadAsync(login.Value.ProfileUrl, whitelist, token, ids => OnUiAsync(() =>
                         {
                             token.ThrowIfCancellationRequested();
                             ApplyVerifiedPrivacy(ids, login.Value.SteamId);
                             return Task.FromResult(true);
-                        }));
+                        }), progress);
                 };
                 var read = await readQueue();
                 if (read.Status == SteamReadStatus.LoginRequired)
@@ -261,12 +290,16 @@ namespace IdleMasterExtended
                 {
                     lastFailure = read.Status;
                     if (read.Status == SteamReadStatus.LoginRequired) authenticated = false;
+                    outcome = read.Status;
                     return SteamReadResult<List<Badge>>.Failed(read.Status, read.Message);
                 }
-                AllBadges = read.Value.Badges; privateAppIds = read.Value.PrivateAppIds; snapshotSteamId = login.Value.SteamId;
+                scannedBadges = read.Value.Badges; AllBadges = scannedBadges;
+                privateAppIds = read.Value.PrivateAppIds; snapshotSteamId = login.Value.SteamId;
                 var sort = forRun ? runSort : Settings.Default.sort;
-                if (sort == "mostcards") AllBadges = AllBadges.OrderByDescending(b => b.RemainingCard).ToList();
-                else if (sort == "leastcards") AllBadges = AllBadges.OrderBy(b => b.RemainingCard).ToList();
+                ApplyQueueSort(sort);
+                scanReuse.RecordComplete(snapshotSteamId, new ScanQueueSource(
+                    (forRun ? runMode : SelectedMode) == IdleMode.Whitelist,
+                    forRun ? runWhitelist : (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>()), privateAppIds);
                 lastFailure = null; ready = true;
                 if (forRun)
                 {
@@ -277,9 +310,59 @@ namespace IdleMasterExtended
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
                 UpdateStateInfo();
+                outcome = SteamReadStatus.Success;
                 return SteamReadResult<List<Badge>>.Succeeded(AllBadges);
             }
-            finally { scanGate.Release(); }
+            catch { scanReuse.Invalidate(); throw; }
+            finally { scanInProgress = false; diagnostic.Complete(outcome, token.IsCancellationRequested); scanGate.Release(); }
+        }
+        private OwnedGamesReader GetLibraryReader()
+        {
+            if (libraryReader == null || !ReferenceEquals(libraryClient, session.Client))
+            {
+                libraryClient = session.Client;
+                libraryReader = new OwnedGamesReader(libraryClient);
+            }
+            return libraryReader;
+        }
+        internal void ReportScanProgress(BadgeScanProgress value, int generation, CancellationToken token)
+        {
+            if (!canCancelScan || token.IsCancellationRequested || closing || IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action(() => ReportScanProgress(value, generation, token))); }
+                catch (InvalidOperationException) { }
+                return;
+            }
+            // Late queued progress cannot overwrite Ready, Running, cancellation, or a newer scan.
+            // Background refreshes retain the run status and never reveal or activate the window.
+            if (!scanInProgress || scanGeneration != generation || !busy || Running) return;
+            switch (value.Stage)
+            {
+                case BadgeScanStage.PrivateGames: SetMessage(UiText.Get("scan_private_games")); break;
+                case BadgeScanStage.OwnedGames: SetMessage(UiText.Get("scan_owned_games")); break;
+                case BadgeScanStage.BadgePages: SetMessage(string.Format(UiText.Get("scan_badge_pages"), value.Completed, value.Total)); break;
+                case BadgeScanStage.GameDetails: SetMessage(string.Format(UiText.Get("scan_card_pages"), value.Completed, value.Total)); break;
+            }
+        }
+        private async Task<SteamReadResult<List<Badge>>> ReadBeforeNewRunAsync(SteamSession account, CancellationToken token)
+        {
+            var reuse = await scanReuse.VerifyForStartAsync(account.SteamId, CaptureQueueSettings().Source, false,
+                GetLibraryReader(), account.ProfileUrl, token, ids => OnUiAsync(() =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    ApplyVerifiedPrivacy(ids, account.SteamId);
+                    return Task.FromResult(true);
+                }));
+            if (!reuse.IsSuccess)
+            {
+                lastFailure = reuse.Status;
+                if (reuse.Status == SteamReadStatus.LoginRequired) authenticated = false;
+                return SteamReadResult<List<Badge>>.Failed(reuse.Status, reuse.Message);
+            }
+            if (!reuse.Value) return await ScanAsync(token, false);
+            lastFailure = null;
+            return SteamReadResult<List<Badge>>.Succeeded(AllBadges);
         }
         private void ApplyVerifiedPrivacy(HashSet<int> appIds, ulong steamId)
         {
@@ -320,9 +403,10 @@ namespace IdleMasterExtended
         private async Task RefreshManuallyAsync()
         {
             if (busy || Running || closing) return;
-            busy = true; ready = false; picReadingPage.Visible = true; UpdateButtons();
+            busy = true; ready = false; picReadingPage.Visible = true;
             scanCancellation?.Dispose();
             scanCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            canCancelScan = true; UpdateButtons();
             SetMessage(UiText.Get("scanning"));
             try
             {
@@ -330,9 +414,9 @@ namespace IdleMasterExtended
                 if (!read.IsSuccess) { SetMessage(read.Message); btnRefresh.Text = UiText.Get("retry"); }
                 else { SetMessage(GamesForRun().Count == 0 ? UiText.Get("no_cards") : UiText.Get("ready_to_start")); btnRefresh.Text = UiText.Get("refresh"); }
             }
-            catch (OperationCanceledException) { }
+            catch (OperationCanceledException) { if (!closing) { SetMessage(UiText.Get("scan_cancelled")); btnRefresh.Text = UiText.Get("retry"); } }
             catch (Exception ex) { Logger.Exception(ex, "Card scan"); SetMessage(UiText.Get("scan_failed")); }
-            finally { busy = false; if (!closing && !IsDisposed) { picReadingPage.Visible = false; UpdateStateInfo(); UpdateButtons(); } }
+            finally { canCancelScan = false; busy = false; if (!closing && !IsDisposed) { picReadingPage.Visible = false; UpdateStateInfo(); UpdateButtons(); } }
         }
         public Task LoadBadgesAsync() => RefreshManuallyAsync();
         private async Task StartOrResumeAsync()
@@ -342,44 +426,55 @@ namespace IdleMasterExtended
             if (busy || Running || closing) return;
             if (!steamAvailable || steamAccountChanged) { SetMessage(UiText.Get(steamAccountChanged ? "steam_account_mismatch" : "steam_required")); return; }
             if (!ready) { await RefreshManuallyAsync(); if (!ready || busy || Running || closing) return; }
-            busy = true; UpdateButtons();
+            busy = true; scanCancellation?.Dispose();
+            scanCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            var startToken = scanCancellation.Token; canCancelScan = true; UpdateButtons();
+            var startingNewSession = false;
             try
             {
-                var validation = await session.ValidateAsync(lifetime.Token);
-                if (!validation.IsSuccess) { if (validation.Status == SteamReadStatus.LoginRequired) authenticated = false; lastFailure = validation.Status; ready = false; SetMessage(validation.Message); return; }
+                var validation = await session.ValidateAsync(startToken);
+                if (!validation.IsSuccess) { scanReuse.Invalidate(); if (validation.Status == SteamReadStatus.LoginRequired) authenticated = false; lastFailure = validation.Status; ready = false; SetMessage(validation.Message); return; }
                 if ((runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted) && runSteamId != validation.Value.SteamId)
-                { ready = false; SetMessage(UiText.Get("account_changed")); return; }
+                { scanReuse.Invalidate(); ready = false; SetMessage(UiText.Get("account_changed")); return; }
                 if (runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted)
                 {
                     if (runSteamId != validation.Value.SteamId) { ready = false; SetMessage(UiText.Get("account_changed")); return; }
                     // Refresh before manually resuming so stale counts cannot launch completed games.
-                    var read = await ScanAsync(lifetime.Token, true);
+                    var read = await ScanAsync(startToken, true);
                     if (!read.IsSuccess) { ready = false; SetMessage(read.Message); return; }
                 }
                 else
                 {
-                    // Recheck private flags and cards before a new run, as well as on Resume.
+                    // A just-completed scan can supply card counts, but private-game proof
+                    // must be freshly read before every new run. Resume always scans fully.
                     SetMessage(UiText.Get("scanning"));
-                    var read = await ScanAsync(lifetime.Token, false);
+                    var read = await ReadBeforeNewRunAsync(validation.Value, startToken);
                     if (!read.IsSuccess) { ready = false; SetMessage(read.Message); return; }
                     if (GamesForRun().Count == 0) { SetMessage(UiText.Get("no_cards")); return; }
                     statistics = new Statistics(); elapsed.Reset(); artworkAttempts.Clear();
                     deferredRunSettings = false; runMode = SelectedMode; runOnlyPlayed = Settings.Default.IdleOnlyPlayed; runSort = Settings.Default.sort;
                     runBlacklist = new HashSet<string>((Settings.Default.blacklist ?? new System.Collections.Specialized.StringCollection()).Cast<string>());
                     runWhitelist = (Settings.Default.whitelist ?? new System.Collections.Specialized.StringCollection()).Cast<string>().ToList();
+                    startingNewSession = true;
+                }
+                startToken.ThrowIfCancellationRequested();
+                canCancelScan = false; UpdateButtons();
+                runSteamId = snapshotSteamId;
+                await CheckSteamAsync();
+                if (!steamAvailable || steamAccountChanged) { SetMessage(UiText.Get(steamAccountChanged ? "steam_account_mismatch" : "steam_required")); return; }
+                startToken.ThrowIfCancellationRequested();
+                if (startingNewSession)
+                {
                     sessionTracker.Start(GamesForRun(), runMode, AllBadges.Where(b => b.IsPrivate && !runBlacklist.Contains(b.StringId) &&
                         (runMode == IdleMode.Whitelist || (b.RemainingCard != 0 && (!runOnlyPlayed || b.HoursPlayed > 0))))
                         .Select(b => b.AppId)); summaryPanel.Dismiss();
                     statistics.setRemainingCards((uint)Math.Max(0, GamesForRun().Sum(g => g.RemainingCards)));
                 }
-                runSteamId = snapshotSteamId;
-                await CheckSteamAsync();
-                if (!steamAvailable || steamAccountChanged) { SetMessage(UiText.Get(steamAccountChanged ? "steam_account_mismatch" : "steam_required")); return; }
                 await controller.StartAsync(GamesForRun(), runSteamId, EffectiveMode, runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted);
             }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Exception(ex, "Start idle"); SetMessage(ex.Message); }
-            finally { busy = false; UpdateButtons(); }
+            catch (OperationCanceledException) { scanReuse.Invalidate(); ready = false; if (!closing) SetMessage(UiText.Get("scan_cancelled")); }
+            catch (Exception ex) { scanReuse.Invalidate(); Logger.Exception(ex, "Start idle"); SetMessage(ex.Message); }
+            finally { canCancelScan = false; busy = false; UpdateButtons(); }
         }
         private void ControllerChanged(object sender, IdleRunStatus status)
         {
@@ -464,55 +559,57 @@ namespace IdleMasterExtended
         private async Task SwitchAccountAsync()
         {
             if (busy || closing || !session.IsInitialized) return;
-            busy = true; ready = false; UpdateButtons();
+            busy = true; ready = false; authenticated = false; scanReuse.Invalidate(); UpdateButtons();
             try
             {
                 scanCancellation?.Cancel();
                 if (controller != null) await controller.StopAsync();
                 sessionTracker.Abandon(); summaryPanel.Dismiss();
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
-                await session.SignOutAsync();
+                await session.SignOutAsync(lifetime.Token);
                 if (closing) return;
-                AllBadges.Clear(); privateAppIds.Clear(); CurrentBadge = null; authenticated = false; runSteamId = snapshotSteamId = 0; lastFailure = null;
+                AllBadges.Clear(); scannedBadges = null; privateAppIds.Clear(); CurrentBadge = null; authenticated = false; runSteamId = snapshotSteamId = 0; lastFailure = null;
                 UpdateStateInfo();
             }
-            catch (Exception ex) { Logger.Exception(ex, "Switch account"); SetMessage(UiText.Get("sign_in_network")); }
+            catch (Exception ex) { lastFailure = SteamReadStatus.TransientFailure; Logger.Exception(ex, "Switch account"); SetMessage(UiText.Get("sign_in_network")); return; }
             finally { busy = false; UpdateButtons(); }
             if (!closing) await SignInAsync();
         }
         private async Task SignInAsync()
         {
             if (busy || Running || closing) return;
+            if (session.IsCleaningUp) { SetMessage(UiText.Get("signout_wait")); return; }
             if (!session.IsInitialized)
             {
                 OpenUrl("https://developer.microsoft.com/microsoft-edge/webview2/");
                 return;
             }
             busy = true; UpdateButtons();
+            var signedIn = false;
             try
             {
-                using (var dialog = new frmSignIn(session)) dialog.ShowDialog(this);
+                using (var dialog = new frmSignIn(session)) signedIn = dialog.ShowDialog(this) == DialogResult.OK;
             }
             finally { busy = false; UpdateButtons(); }
-            await RefreshManuallyAsync();
+            if (signedIn && !closing) await RefreshManuallyAsync();
         }
         private async void lnkSignIn_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e) => await SignInAsync();
         private async void lnkResetCookies_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
             if (busy || closing) return;
-            busy = true; ready = false; UpdateButtons();
+            busy = true; ready = false; authenticated = false; scanReuse.Invalidate(); UpdateButtons();
             try
             {
                 scanCancellation?.Cancel();
                 if (controller != null) await controller.StopAsync();
                 sessionTracker.Abandon(); summaryPanel.Dismiss();
                 await scanGate.WaitAsync(lifetime.Token); scanGate.Release();
-                await session.SignOutAsync();
+                await session.SignOutAsync(lifetime.Token);
                 if (closing) return;
-                AllBadges.Clear(); privateAppIds.Clear(); CurrentBadge = null; authenticated = false; snapshotSteamId = runSteamId = 0; lastFailure = null;
+                AllBadges.Clear(); scannedBadges = null; privateAppIds.Clear(); CurrentBadge = null; authenticated = false; snapshotSteamId = runSteamId = 0; lastFailure = null;
                 SetMessage(UiText.Get("signed_out")); UpdateStateInfo();
             }
-            catch (Exception ex) { Logger.Exception(ex, "Sign out"); SetMessage(UiText.Get("sign_in_network")); }
+            catch (Exception ex) { lastFailure = SteamReadStatus.TransientFailure; Logger.Exception(ex, "Sign out"); SetMessage(UiText.Get("sign_in_network")); }
             finally { busy = false; UpdateButtons(); }
         }
         private void UpdateButtons()
@@ -522,13 +619,14 @@ namespace IdleMasterExtended
             btnStart.Enabled = !busy && !Running && ready && authenticated && session.Current != null && GamesForRun().Count > 0 && steamAvailable && !steamAccountChanged;
             btnStart.Text = runStatus?.State == IdleRunState.Paused || runStatus?.State == IdleRunState.Faulted ? UiText.Get("resume") : UiText.Get("start");
             btnStop.Enabled = !busy && sessionTracker.Active;
-            btnPause.Enabled = !busy && Running; btnRefresh.Enabled = !busy && !Running && session.IsInitialized;
+            btnPause.Enabled = !busy && Running; btnRefresh.Enabled = canCancelScan || (!busy && !Running && session.IsInitialized);
+            btnRefresh.Text = canCancelScan ? UiText.Get("cancel_scan") : lastFailure.HasValue || !ready ? UiText.Get("retry") : UiText.Get("refresh");
             btnSkip.Enabled = !busy && Running && runStatus?.GameplayActive != true && EffectiveMode != IdleMode.Fast && EffectiveMode != IdleMode.Whitelist;
             pauseIdlingToolStripMenuItem.Enabled = btnPause.Enabled; resumeIdlingToolStripMenuItem.Enabled = btnStart.Enabled;
             skipGameToolStripMenuItem.Enabled = btnSkip.Enabled; blacklistCurrentGameToolStripMenuItem.Enabled = Running && CurrentBadge != null;
             settingsToolStripMenuItem.Enabled = !busy; whitelistToolStripMenuItem.Enabled = blacklistToolStripMenuItem.Enabled = !busy;
             lnkSignIn.Visible = !authenticated; lnkResetCookies.Visible = authenticated;
-            lnkSignIn.Enabled = !busy && !Running; lnkResetCookies.Enabled = switchAccount.Enabled = !busy;
+            lnkSignIn.Enabled = !busy && !Running && !session.IsCleaningUp; lnkResetCookies.Enabled = switchAccount.Enabled = !busy;
             switchAccount.Visible = authenticated || session.Current != null || lastFailure == SteamReadStatus.MalformedPage;
             lblCookieStatus.Text = lastFailure == SteamReadStatus.TransientFailure || lastFailure == SteamReadStatus.MalformedPage ? UiText.Get("account_unavailable") : authenticated ? UiText.Get("account_connected") : UiText.Get("sign_in_required");
             picCookieStatus.Image = StatusImage(authenticated);
@@ -713,12 +811,23 @@ namespace IdleMasterExtended
         private async Task EditAndRefreshAsync(Func<DialogResult> edit)
         {
             if (busy || closing) return;
+            var before = CaptureQueueSettings();
             busy = true; UpdateButtons();
             var saved = false;
+            var fullScan = false;
+            var runChanges = false;
             try
             {
                 saved = edit() == DialogResult.OK;
-                if (saved) { if (sessionTracker.Active) deferredRunSettings = true; SetLanguage(); LocalizeMenus(); ApplyTheme(); }
+                if (saved)
+                {
+                    var after = CaptureQueueSettings();
+                    fullScan = before.RequiresFullScan(after);
+                    runChanges = before.HasRunChanges(after);
+                    if (fullScan) scanReuse.Invalidate();
+                    if (sessionTracker.Active && runChanges) deferredRunSettings = true;
+                    SetLanguage(); LocalizeMenus(); ApplyTheme();
+                }
             }
             catch (Exception ex) { Logger.Exception(ex, "Edit settings"); SetMessage(UiText.Get("scan_failed")); }
             finally { busy = false; UpdateButtons(); }
@@ -729,9 +838,18 @@ namespace IdleMasterExtended
             {
                 if (Running && runStatus?.ActiveGames.Count > 0 && Settings.Default.NoSleep) NativeMethods.SetThreadExecutionState(NativeMethods.ExecutionState.EsContinuous | NativeMethods.ExecutionState.EsSystemRequired);
                 else AllowSleep();
-                SetMessage(UiText.Get("settings_next_session"));
+                if (runChanges) SetMessage(UiText.Get("settings_next_session"));
             }
-            else await RefreshManuallyAsync();
+            else if (fullScan) await RefreshManuallyAsync();
+            else
+            {
+                // Complete card snapshots contain the unfiltered queue. Sorting and filters
+                // can be reapplied locally; theme, username and sleep edits need no Steam reads.
+                ApplyQueueSort(Settings.Default.sort);
+                AllowSleep();
+                if (runChanges && ready) SetMessage(GamesForRun().Count == 0 ? UiText.Get("no_cards") : UiText.Get("ready_to_start"));
+            }
+            UpdateStateInfo(); UpdateButtons();
         }
         private async void settingsToolStripMenuItem_Click(object sender, EventArgs e)
             => await EditAndRefreshAsync(() => { using (var dialog = new frmSettings()) return dialog.ShowDialog(this); });
